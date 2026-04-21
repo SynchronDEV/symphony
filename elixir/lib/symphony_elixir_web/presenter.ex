@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, TokenUsageLedger}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -22,6 +22,7 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
+          token_usage: TokenUsageLedger.summary(),
           rate_limits: snapshot.rate_limits
         }
 
@@ -40,11 +41,12 @@ defmodule SymphonyElixirWeb.Presenter do
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
         blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
+        token_usage = TokenUsageLedger.issue_summary(issue_identifier)
 
-        if is_nil(running) and is_nil(retry) and is_nil(blocked) do
+        if is_nil(running) and is_nil(retry) and is_nil(blocked) and is_nil(token_usage) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, blocked)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, blocked, token_usage)}
         end
 
       _ ->
@@ -63,14 +65,14 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, blocked) do
+  defp issue_payload_body(issue_identifier, running, retry, blocked, token_usage) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, blocked),
-      status: issue_status(running, retry, blocked),
+      issue_id: issue_id_from_entries(running, retry, blocked, token_usage),
+      status: issue_status(running, retry, blocked, token_usage),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, blocked),
-        host: workspace_host(running, retry, blocked)
+        path: workspace_path(issue_identifier, running, retry, blocked, token_usage),
+        host: workspace_host(running, retry, blocked, token_usage)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -84,20 +86,26 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       recent_events: recent_events_payload(running || blocked),
       last_error: (blocked && blocked.error) || (retry && retry.error),
-      tracked: %{}
+      tracked: %{},
+      token_usage: token_usage && token_usage_payload(token_usage)
     }
   end
 
-  defp issue_id_from_entries(running, retry, blocked),
-    do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
+  defp issue_id_from_entries(running, retry, blocked, token_usage),
+    do:
+      (running && running.issue_id) ||
+        (retry && retry.issue_id) ||
+        (blocked && blocked.issue_id) ||
+        (token_usage && token_usage.issue_id)
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
-  defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
-  defp issue_status(nil, nil, _blocked), do: "blocked"
+  defp issue_status(running, _retry, _blocked, _token_usage) when not is_nil(running), do: "running"
+  defp issue_status(nil, retry, _blocked, _token_usage) when not is_nil(retry), do: "retrying"
+  defp issue_status(nil, nil, blocked, _token_usage) when not is_nil(blocked), do: "blocked"
+  defp issue_status(nil, nil, nil, %{}), do: "inactive"
 
   defp running_entry_payload(entry) do
     %{
@@ -197,17 +205,28 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry, blocked) do
+  defp workspace_path(issue_identifier, running, retry, blocked, token_usage) do
     (running && Map.get(running, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
       (blocked && Map.get(blocked, :workspace_path)) ||
+      (token_usage && Map.get(token_usage, :workspace_path)) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry, blocked) do
+  defp workspace_host(running, retry, blocked, token_usage) do
     (running && Map.get(running, :worker_host)) ||
       (retry && Map.get(retry, :worker_host)) ||
-      (blocked && Map.get(blocked, :worker_host))
+      (blocked && Map.get(blocked, :worker_host)) ||
+      (token_usage && Map.get(token_usage, :worker_host))
+  end
+
+  defp token_usage_payload(token_usage) do
+    %{
+      input_tokens: token_usage.input_tokens,
+      output_tokens: token_usage.output_tokens,
+      total_tokens: token_usage.total_tokens,
+      session_count: token_usage.session_count
+    }
   end
 
   defp issue_url_from_entry(%{issue: %{url: url}}), do: url
