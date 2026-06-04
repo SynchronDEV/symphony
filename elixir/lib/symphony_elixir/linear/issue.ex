@@ -40,4 +40,19 @@ defmodule SymphonyElixir.Linear.Issue do
   def label_names(%__MODULE__{labels: labels}) do
     labels
   end
+
+  @doc """
+  Returns true when the issue carries any label in `stop_labels`.
+
+  Used to keep already-completed work (e.g. a review that passed and now waits
+  for a human to merge) out of both dispatch and continuation, so the agent loop
+  does not keep re-running it while it lingers in an active state.
+  """
+  @spec stop_continue_labeled?(t(), [String.t()]) :: boolean()
+  def stop_continue_labeled?(%__MODULE__{labels: labels}, stop_labels)
+      when is_list(labels) and is_list(stop_labels) do
+    stop_labels != [] and Enum.any?(labels, &(&1 in stop_labels))
+  end
+
+  def stop_continue_labeled?(_issue, _stop_labels), do: false
 end

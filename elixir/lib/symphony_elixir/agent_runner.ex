@@ -147,10 +147,17 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
-          {:continue, refreshed_issue}
-        else
-          {:done, refreshed_issue}
+        cond do
+          not active_issue_state?(refreshed_issue.state) ->
+            {:done, refreshed_issue}
+
+          stop_continue_label?(refreshed_issue) ->
+            Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue carries a stop-continue label while still in an active state; returning control to orchestrator")
+
+            {:done, refreshed_issue}
+
+          true ->
+            {:continue, refreshed_issue}
         end
 
       {:ok, []} ->
@@ -162,6 +169,12 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp stop_continue_label?(%Issue{} = issue) do
+    Issue.stop_continue_labeled?(issue, Config.settings!().agent.stop_continue_labels)
+  end
+
+  defp stop_continue_label?(_issue), do: false
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

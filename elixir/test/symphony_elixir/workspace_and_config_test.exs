@@ -558,6 +558,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "issue carrying a stop-continue label is not dispatch-eligible while still active" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      stop_continue_labels: ["symphony-reviewed-pass"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    passed_issue = %Issue{
+      id: "reviewed-pass-1",
+      identifier: "MT-1010",
+      title: "Already reviewed and passed",
+      state: "In Review",
+      labels: ["symphony-reviewed-pass"]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(passed_issue, state)
+
+    unlabeled_issue = %Issue{passed_issue | id: "reviewed-pass-2", identifier: "MT-1011", labels: []}
+
+    assert Orchestrator.should_dispatch_issue_for_test(unlabeled_issue, state)
+  end
+
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do
     stale_issue = %Issue{
       id: "blocked-2",
@@ -582,6 +611,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert skipped_issue.identifier == "MT-1005"
     assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+  end
+
+  test "dispatch revalidation skips an issue that acquired a stop-continue label mid-run" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      stop_continue_labels: ["symphony-reviewed-pass"]
+    )
+
+    dispatched_issue = %Issue{
+      id: "passed-mid-run",
+      identifier: "MT-1012",
+      title: "Completed and reviewed during the run",
+      state: "In Review",
+      labels: []
+    }
+
+    # After the run, the agent recorded a pass and the issue now carries the label.
+    refreshed_issue = %Issue{dispatched_issue | labels: ["symphony-reviewed-pass"]}
+
+    fetcher = fn ["passed-mid-run"] -> {:ok, [refreshed_issue]} end
+
+    assert {:skip, %Issue{} = skipped_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(dispatched_issue, fetcher)
+
+    assert skipped_issue.identifier == "MT-1012"
+    assert "symphony-reviewed-pass" in skipped_issue.labels
   end
 
   test "workspace remove returns error information for missing directory" do
