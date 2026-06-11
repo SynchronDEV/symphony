@@ -78,7 +78,8 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
-    with {:ok, response} <- client_module().graphql(@create_comment_mutation, %{issueId: issue_id, body: body}),
+    with {:ok, response} <-
+           client_module().graphql(@create_comment_mutation, %{issueId: issue_id, body: body}, critical?: true),
          true <- get_in(response, ["data", "commentCreate", "success"]) == true do
       :ok
     else
@@ -91,7 +92,8 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec apply_label(String.t(), String.t()) :: :ok | {:error, term()}
   def apply_label(issue_id, label_name) when is_binary(issue_id) and is_binary(label_name) do
     with {:ok, label_ids} <- resolve_label_ids(issue_id, label_name),
-         {:ok, response} <- client_module().graphql(@update_labels_mutation, %{issueId: issue_id, labelIds: label_ids}),
+         {:ok, response} <-
+           client_module().graphql(@update_labels_mutation, %{issueId: issue_id, labelIds: label_ids}, critical?: true),
          true <- get_in(response, ["data", "issueUpdate", "success"]) == true do
       :ok
     else
@@ -106,7 +108,7 @@ defmodule SymphonyElixir.Linear.Adapter do
       when is_binary(issue_id) and is_binary(state_name) do
     with {:ok, state_id} <- resolve_state_id(issue_id, state_name),
          {:ok, response} <-
-           client_module().graphql(@update_state_mutation, %{issueId: issue_id, stateId: state_id}),
+           client_module().graphql(@update_state_mutation, %{issueId: issue_id, stateId: state_id}, critical?: true),
          true <- get_in(response, ["data", "issueUpdate", "success"]) == true do
       :ok
     else
@@ -122,7 +124,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp resolve_state_id(issue_id, state_name) do
     with {:ok, response} <-
-           client_module().graphql(@state_lookup_query, %{issueId: issue_id, stateName: state_name}),
+           client_module().graphql(@state_lookup_query, %{issueId: issue_id, stateName: state_name}, critical?: true),
          state_id when is_binary(state_id) <-
            get_in(response, ["data", "issue", "team", "states", "nodes", Access.at(0), "id"]) do
       {:ok, state_id}
@@ -133,7 +135,8 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   defp resolve_label_ids(issue_id, label_name) do
-    with {:ok, response} <- client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}),
+    with {:ok, response} <-
+           client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}, critical?: true),
          label_id when is_binary(label_id) <-
            get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
       existing_label_ids =

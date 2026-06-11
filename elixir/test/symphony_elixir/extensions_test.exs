@@ -30,7 +30,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, issue_ids}
     end
 
-    def graphql(query, variables) do
+    def graphql(query, variables, _opts \\ []) do
       send(self(), {:graphql_called, query, variables})
 
       case Process.get({__MODULE__, :graphql_results}) do

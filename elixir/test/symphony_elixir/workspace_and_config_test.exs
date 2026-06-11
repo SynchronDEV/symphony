@@ -529,6 +529,73 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              )
   end
 
+  test "linear client rate-limit retry waits a fallback delay when no reset timestamp is known" do
+    # Production logs show Linear returning RATELIMITED with an EMPTY headers
+    # map; without a reset timestamp the retry must not fire immediately into
+    # the same exhausted window.
+    parent = self()
+
+    on_exit(fn -> Agent.update(SymphonyElixir.Linear.RateLimitBudget, fn _ -> nil end) end)
+    Agent.update(SymphonyElixir.Linear.RateLimitBudget, fn _ -> nil end)
+
+    assert {:error, {:rate_limited, nil}} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 400,
+                    headers: %{},
+                    body: %{
+                      "errors" => [
+                        %{
+                          "message" => "Rate limit exceeded",
+                          "extensions" => %{"code" => "RATELIMITED"}
+                        }
+                      ]
+                    }
+                  }}
+               end,
+               sleep_fun: fn ms -> send(parent, {:fallback_sleep, ms}) end
+             )
+
+    assert_receive {:fallback_sleep, 60_000}
+  end
+
+  test "linear client delays non-critical requests by default when the rate-limit budget is low" do
+    parent = self()
+    reset_at = DateTime.utc_now() |> DateTime.add(2, :second)
+
+    on_exit(fn -> Agent.update(SymphonyElixir.Linear.RateLimitBudget, fn _ -> nil end) end)
+
+    Agent.update(SymphonyElixir.Linear.RateLimitBudget, fn _ ->
+      %{remaining: 10, reset_at: reset_at, updated_at: DateTime.utc_now()}
+    end)
+
+    request_fun = fn _payload, _headers ->
+      {:ok, %{status: 200, headers: %{}, body: %{"data" => %{}}}}
+    end
+
+    # Reads default to non-critical: they wait out the low budget window.
+    assert {:ok, _} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               request_fun: request_fun,
+               sleep_fun: fn ms -> send(parent, {:budget_gate_sleep, ms}) end
+             )
+
+    assert_receive {:budget_gate_sleep, gate_ms}
+    assert gate_ms > 0
+
+    # Control-plane mutations pass critical?: true and bypass the gate.
+    assert {:ok, _} =
+             Client.graphql("mutation { x }", %{},
+               critical?: true,
+               request_fun: request_fun,
+               sleep_fun: fn ms -> send(parent, {:critical_sleep, ms}) end
+             )
+
+    refute_receive {:critical_sleep, _}, 50
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",

@@ -10,6 +10,11 @@ defmodule SymphonyElixir.Linear.Client do
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
   @default_rate_limit_retries 1
+  # When Linear reports RATELIMITED without usable rate-limit headers
+  # (observed in production: empty headers map on the GraphQL 400 path),
+  # delay_until_reset has no reset timestamp — wait this long instead of
+  # retrying immediately into the same exhausted window.
+  @rate_limited_fallback_ms 60_000
 
   @query """
   query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
@@ -416,7 +421,11 @@ defmodule SymphonyElixir.Linear.Client do
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
     sleep_fun = Keyword.get(opts, :sleep_fun, &Process.sleep/1)
 
-    if Keyword.get(opts, :critical?, true) == false and RateLimitBudget.low?() do
+    # Default is NON-critical: every read waits out a low budget. Only the
+    # control plane (state transitions, comments, labels — the adapter
+    # mutations) passes critical?: true to bypass the gate, since blocking
+    # those stalls issue lifecycle transitions.
+    if not Keyword.get(opts, :critical?, false) and RateLimitBudget.low?() do
       RateLimitBudget.delay_until_reset(sleep_fun)
     end
 
@@ -459,7 +468,12 @@ defmodule SymphonyElixir.Linear.Client do
 
     if retries_left > 0 do
       Logger.warning("Linear GraphQL request rate-limited; retrying after reset_at=#{inspect(reset_at)}")
-      RateLimitBudget.delay_until_reset(Keyword.get(opts, :sleep_fun, &Process.sleep/1))
+
+      RateLimitBudget.delay_until_reset(
+        Keyword.get(opts, :sleep_fun, &Process.sleep/1),
+        @rate_limited_fallback_ms
+      )
+
       do_graphql_request(payload, opts, retries_left - 1)
     else
       {:error, {:rate_limited, reset_at}}

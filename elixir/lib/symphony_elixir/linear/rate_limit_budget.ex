@@ -56,13 +56,22 @@ defmodule SymphonyElixir.Linear.RateLimitBudget do
   end
 
   @spec delay_until_reset((non_neg_integer() -> :ok)) :: :ok
-  def delay_until_reset(sleep_fun \\ &Process.sleep/1) when is_function(sleep_fun, 1) do
+  def delay_until_reset(sleep_fun \\ &Process.sleep/1, fallback_ms \\ 0)
+      when is_function(sleep_fun, 1) and is_integer(fallback_ms) and fallback_ms >= 0 do
     case reset_at() do
       %DateTime{} = reset_at ->
         reset_at
         |> DateTime.diff(DateTime.utc_now(), :millisecond)
         |> max(0)
         |> sleep_fun.()
+
+      # No reset timestamp known (Linear can return RATELIMITED with empty
+      # headers). Callers that MUST wait — e.g. an in-request rate-limit
+      # retry — pass a fallback so the retry doesn't fire immediately into
+      # the same exhausted window. Callers using this as an optional
+      # low-budget gate keep the default 0 (no-op).
+      _ when fallback_ms > 0 ->
+        sleep_fun.(fallback_ms)
 
       _ ->
         :ok
