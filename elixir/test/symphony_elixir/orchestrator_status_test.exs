@@ -90,6 +90,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.issue_id == issue_id
+    assert snapshot_entry.issue_url == "https://example.org/issues/MT-188"
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now
@@ -813,6 +814,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       timer_ref: nil,
       due_at_ms: System.monotonic_time(:millisecond) + 5_000,
       identifier: "MT-500",
+      issue_url: "https://example.org/issues/MT-500",
       error: "agent exited: :boom"
     }
 
@@ -829,6 +831,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                attempt: 2,
                due_in_ms: due_in_ms,
                identifier: "MT-500",
+               issue_url: "https://example.org/issues/MT-500",
                error: "agent exited: :boom"
              }
            ] = snapshot.retrying
@@ -1012,7 +1015,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       pid: worker_pid,
       ref: make_ref(),
       identifier: "MT-STALL",
-      issue: %Issue{id: issue_id, identifier: "MT-STALL", state: "In Progress"},
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-STALL",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-STALL"
+      },
       session_id: "thread-stall-turn-stall",
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
@@ -1037,6 +1045,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              attempt: 1,
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
+             issue_url: "https://example.org/issues/MT-STALL",
              error: "stalled for " <> _
            } = state.retry_attempts[issue_id]
 
@@ -1076,7 +1085,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       pid: worker_pid,
       ref: make_ref(),
       identifier: "MT-MCP",
-      issue: %Issue{id: issue_id, identifier: "MT-MCP", state: "In Progress"},
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-MCP",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-MCP"
+      },
       worker_host: "dm-dev2",
       workspace_path: "/workspaces/MT-MCP",
       session_id: "thread-mcp-turn-mcp",
@@ -1112,7 +1126,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              workspace_path: "/workspaces/MT-MCP"
            } = state.blocked[issue_id]
 
-    assert %{blocked: [%{identifier: "MT-MCP", error: "codex MCP elicitation requires operator input"}]} =
+    assert %{
+             blocked: [
+               %{
+                 identifier: "MT-MCP",
+                 issue_url: "https://example.org/issues/MT-MCP",
+                 error: "codex MCP elicitation requires operator input"
+               }
+             ]
+           } =
              Orchestrator.snapshot(orchestrator_name, 1_000)
   end
 
