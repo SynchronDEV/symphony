@@ -363,7 +363,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_budget, tool_executor, auto_approve_requests, elicitation_policy)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_budget,
+          tool_executor,
+          auto_approve_requests,
+          elicitation_policy
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -497,6 +506,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
   defp handle_turn_method(
          port,
          on_message,
@@ -571,6 +581,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  # credo:disable-for-lines:300 Credo.Check.Refactor.FunctionArity
   defp maybe_handle_approval_request(
          port,
          "item/commandExecution/requestApproval",

@@ -100,6 +100,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
@@ -199,6 +200,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp timeout_reason_for_log(:stall_timeout), do: "stalled"
   defp timeout_reason_for_log(:turn_timeout), do: "timed out"
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
   defp resume_after_issue_refresh_pause(
          app_session,
          workspace,

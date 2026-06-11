@@ -440,17 +440,15 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp handle_graphql_response(payload, opts, retries_left, %{status: status, body: body} = response) do
-    cond do
-      rate_limited_status?(status) or rate_limited_body?(body) ->
-        retry_or_rate_limited(payload, opts, retries_left)
+    if rate_limited_status?(status) or rate_limited_body?(body) do
+      retry_or_rate_limited(payload, opts, retries_left)
+    else
+      Logger.error(
+        "Linear GraphQL request failed status=#{response.status}" <>
+          linear_error_context(payload, response)
+      )
 
-      true ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
-
-        {:error, {:linear_api_status, response.status}}
+      {:error, {:linear_api_status, response.status}}
     end
   end
 

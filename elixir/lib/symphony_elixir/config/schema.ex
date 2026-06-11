@@ -61,7 +61,17 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :required_labels, :active_states, :terminal_states, :delta_polling],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :required_labels,
+          :active_states,
+          :terminal_states,
+          :delta_polling
+        ],
         empty_values: []
       )
       |> update_change(:required_labels, fn labels ->

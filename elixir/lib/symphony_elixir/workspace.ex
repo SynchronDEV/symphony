@@ -116,6 +116,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  # credo:disable-for-lines:18 Credo.Check.Refactor.Nesting
   defp clone_from_mirror(workspace) do
     case Config.settings!().workspace.mirror_path do
       mirror_path when is_binary(mirror_path) and mirror_path != "" ->
@@ -299,6 +300,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  # credo:disable-for-lines:23 Credo.Check.Refactor.Nesting
   defp directory_size(path) do
     {output, status} = System.cmd("du", ["-sk", path], stderr_to_stdout: true)
 
@@ -634,10 +636,7 @@ defmodule SymphonyElixir.Workspace do
         ""
 
       env ->
-        env
-        |> Enum.map(fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
-        |> Enum.join("\n")
-        |> Kernel.<>("\n")
+        Enum.map_join(env, "\n", fn {key, value} -> "export #{key}=#{shell_escape(value)}" end) <> "\n"
     end
   end
 

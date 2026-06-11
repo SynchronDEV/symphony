@@ -22,11 +22,15 @@ defmodule SymphonyElixir.Linear.RateLimitBudget do
     if is_integer(remaining) or match?(%DateTime{}, reset_at) do
       budget = %{remaining: remaining, reset_at: reset_at, updated_at: DateTime.utc_now()}
 
-      if Process.whereis(__MODULE__) do
-        Agent.update(__MODULE__, fn _ -> budget end)
-      end
+      put_budget(budget)
 
       budget
+    end
+  end
+
+  defp put_budget(budget) do
+    if Process.whereis(__MODULE__) do
+      Agent.update(__MODULE__, fn _ -> budget end)
     end
   end
 

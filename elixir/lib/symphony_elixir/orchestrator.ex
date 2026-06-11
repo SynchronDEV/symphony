@@ -1407,6 +1407,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
+  # credo:disable-for-lines:18 Credo.Check.Refactor.Nesting
   defp start_cleanup_task(fun) when is_function(fun, 0) do
     if test_env?() do
       fun.()
@@ -1436,6 +1437,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.get(:worker_host)
   end
 
+  # credo:disable-for-lines:22 Credo.Check.Refactor.Nesting
   defp run_terminal_workspace_cleanup do
     start_cleanup_task(fn ->
       case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
@@ -1638,6 +1640,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp commits_ahead(nil, _worker_host), do: nil
   defp commits_ahead(_workspace_path, worker_host) when is_binary(worker_host), do: nil
 
+  # credo:disable-for-lines:18 Credo.Check.Refactor.Nesting
   defp commits_ahead(workspace_path, nil) when is_binary(workspace_path) do
     if File.dir?(Path.join(workspace_path, ".git")) do
       case System.cmd("git", ["-C", workspace_path, "rev-list", "--count", "@{upstream}..HEAD"], stderr_to_stdout: true) do

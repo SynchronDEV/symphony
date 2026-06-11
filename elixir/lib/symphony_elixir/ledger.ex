@@ -51,11 +51,12 @@ defmodule SymphonyElixir.Ledger do
   def increment(issue_id, key, amount \\ 1)
       when is_binary(issue_id) and is_atom(key) and is_integer(amount) do
     update(issue_id, fn entry ->
-      Map.update(entry, key, amount, fn value ->
-        if is_integer(value), do: value + amount, else: amount
-      end)
+      Map.update(entry, key, amount, &increment_value(&1, amount))
     end)
   end
+
+  defp increment_value(value, amount) when is_integer(value), do: value + amount
+  defp increment_value(_value, amount), do: amount
 
   @spec add_tokens(issue_id(), map()) :: issue_entry()
   def add_tokens(issue_id, token_delta) when is_binary(issue_id) and is_map(token_delta) do
