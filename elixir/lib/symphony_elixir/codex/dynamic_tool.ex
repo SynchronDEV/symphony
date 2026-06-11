@@ -6,6 +6,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   alias SymphonyElixir.Linear.Client
 
   @linear_graphql_tool "linear_graphql"
+  # Tool output is injected verbatim into the Codex thread and stays in
+  # context for every subsequent turn. An uncapped response (e.g. a broad
+  # issues query with comments) can add 50KB+ per call, so cap it and tell
+  # the agent how to narrow the query instead.
+  @max_output_bytes 16_384
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
   """
@@ -126,6 +131,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp dynamic_tool_response(success, output) when is_boolean(success) and is_binary(output) do
+    output = truncate_output(output)
+
     %{
       "success" => success,
       "output" => output,
@@ -136,6 +143,28 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         }
       ]
     }
+  end
+
+  defp truncate_output(output) when byte_size(output) <= @max_output_bytes, do: output
+
+  defp truncate_output(output) do
+    truncated =
+      output
+      |> binary_part(0, @max_output_bytes)
+      |> trim_invalid_utf8_suffix()
+
+    truncated <>
+      "\n\n[TRUNCATED by Symphony: response was #{byte_size(output)} bytes; the limit is " <>
+      "#{@max_output_bytes} bytes. Narrow the GraphQL query — select fewer fields, add " <>
+      "`first:` pagination, or filter — and retry.]"
+  end
+
+  defp trim_invalid_utf8_suffix(binary) do
+    if String.valid?(binary) or byte_size(binary) == 0 do
+      binary
+    else
+      trim_invalid_utf8_suffix(binary_part(binary, 0, byte_size(binary) - 1))
+    end
   end
 
   defp encode_payload(payload) when is_map(payload) or is_list(payload) do

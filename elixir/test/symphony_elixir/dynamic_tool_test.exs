@@ -3,6 +3,24 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
+  test "linear_graphql truncates oversized responses and tells the agent to narrow the query" do
+    # Tool output is injected into the Codex thread and stays in context for
+    # every later turn — an uncapped broad query response is a permanent
+    # token leak for the rest of the thread.
+    huge = String.duplicate("x", 100_000)
+    linear_client = fn _query, _variables, _opts -> {:ok, %{"data" => %{"blob" => huge}}} end
+
+    response =
+      DynamicTool.execute("linear_graphql", %{"query" => "query { issues { nodes { id } } }"}, linear_client: linear_client)
+
+    assert response["success"] == true
+    assert byte_size(response["output"]) < 20_000
+    assert response["output"] =~ "TRUNCATED by Symphony"
+    assert response["output"] =~ "first:"
+    assert [%{"type" => "inputText", "text" => text}] = response["contentItems"]
+    assert text == response["output"]
+  end
+
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
              %{
