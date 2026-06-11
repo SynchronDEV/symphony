@@ -11,24 +11,50 @@ defmodule SymphonyElixir.PromptBuilder do
   def build_prompt(issue, opts \\ []) do
     template =
       Workflow.current()
-      |> prompt_template!()
+      |> prompt_template!(issue)
       |> parse_template!()
 
     template
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
+        "issue" => issue |> Map.from_struct() |> to_solid_map(),
+        "previous_attempt" => previous_attempt(opts)
       },
       @render_opts
     )
     |> IO.iodata_to_binary()
   end
 
-  defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
+  defp prompt_template!({:ok, %{prompt_template: prompt}}, issue) do
+    issue
+    |> state_prompt_template()
+    |> case do
+      template when is_binary(template) -> template
+      _ -> default_prompt(prompt)
+    end
+  end
 
-  defp prompt_template!({:error, reason}) do
+  defp prompt_template!({:error, reason}, _issue) do
     raise RuntimeError, "workflow_unavailable: #{inspect(reason)}"
+  end
+
+  defp state_prompt_template(%{state: state}) when is_binary(state) do
+    Config.settings!().agent.prompt_template_by_state[Config.Schema.normalize_issue_state(state)]
+  end
+
+  defp state_prompt_template(_issue), do: nil
+
+  defp previous_attempt(opts) do
+    %{
+      last_agent_message: nil,
+      dirty_files: [],
+      commits_ahead: nil,
+      turns_used: 0,
+      token_total: 0
+    }
+    |> Map.merge(Keyword.get(opts, :previous_attempt, %{}) || %{})
+    |> to_solid_value()
   end
 
   defp parse_template!(prompt) when is_binary(prompt) do

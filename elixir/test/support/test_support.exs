@@ -36,6 +36,7 @@ defmodule SymphonyElixir.TestSupport do
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+        if Process.whereis(SymphonyElixir.Ledger), do: SymphonyElixir.Ledger.reset!()
         stop_default_http_server()
 
         on_exit(fn ->
@@ -43,6 +44,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          if Process.whereis(SymphonyElixir.Ledger), do: SymphonyElixir.Ledger.reset!()
           File.rm_rf(workflow_root)
         end)
 
@@ -97,16 +99,26 @@ defmodule SymphonyElixir.TestSupport do
           tracker_api_token: "token",
           tracker_project_slug: "project",
           tracker_assignee: nil,
+          tracker_required_labels: [],
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+          tracker_delta_polling: true,
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+          workspace_mirror_path: nil,
+          workspace_env: %{},
+          workspace_max_total_gb: nil,
+          workspace_keep_last_n: 5,
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
+          max_tokens_per_issue: nil,
+          max_dispatch_attempts: nil,
+          max_rework_cycles: nil,
           max_concurrent_agents_by_state: %{},
+          prompt_template_by_state: %{},
           stop_continue_labels: [],
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
@@ -115,6 +127,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_elicitation_policy: "decline",
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -135,16 +148,26 @@ defmodule SymphonyElixir.TestSupport do
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
+    tracker_required_labels = Keyword.get(config, :tracker_required_labels)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
+    tracker_delta_polling = Keyword.get(config, :tracker_delta_polling)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
+    workspace_mirror_path = Keyword.get(config, :workspace_mirror_path)
+    workspace_env = Keyword.get(config, :workspace_env)
+    workspace_max_total_gb = Keyword.get(config, :workspace_max_total_gb)
+    workspace_keep_last_n = Keyword.get(config, :workspace_keep_last_n)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
+    max_tokens_per_issue = Keyword.get(config, :max_tokens_per_issue)
+    max_dispatch_attempts = Keyword.get(config, :max_dispatch_attempts)
+    max_rework_cycles = Keyword.get(config, :max_rework_cycles)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    prompt_template_by_state = Keyword.get(config, :prompt_template_by_state)
     stop_continue_labels = Keyword.get(config, :stop_continue_labels)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
@@ -153,6 +176,7 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_elicitation_policy = Keyword.get(config, :codex_elicitation_policy)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -174,18 +198,28 @@ defmodule SymphonyElixir.TestSupport do
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
+        "  required_labels: #{yaml_value(tracker_required_labels)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        "  delta_polling: #{yaml_value(tracker_delta_polling)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
+        "  mirror_path: #{yaml_value(workspace_mirror_path)}",
+        "  env: #{yaml_value(workspace_env)}",
+        "  max_total_gb: #{yaml_value(workspace_max_total_gb)}",
+        "  keep_last_n: #{yaml_value(workspace_keep_last_n)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
+        "  max_tokens_per_issue: #{yaml_value(max_tokens_per_issue)}",
+        "  max_dispatch_attempts: #{yaml_value(max_dispatch_attempts)}",
+        "  max_rework_cycles: #{yaml_value(max_rework_cycles)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "  prompt_template_by_state: #{yaml_value(prompt_template_by_state)}",
         "  stop_continue_labels: #{yaml_value(stop_continue_labels)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
@@ -195,6 +229,7 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "  elicitation_policy: #{yaml_value(codex_elicitation_policy)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

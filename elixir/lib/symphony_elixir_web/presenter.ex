@@ -103,6 +103,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      issue_url: issue_url_from_entry(entry),
       state: entry.state,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -124,6 +125,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      issue_url: Map.get(entry, :issue_url),
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error,
@@ -136,6 +138,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      issue_url: issue_url_from_entry(entry),
       state: entry.state,
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
@@ -151,6 +154,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp running_issue_payload(running) do
     %{
       worker_host: Map.get(running, :worker_host),
+      issue_url: issue_url_from_entry(running),
       workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
@@ -170,6 +174,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_issue_payload(retry) do
     %{
       attempt: retry.attempt,
+      issue_url: Map.get(retry, :issue_url),
       due_at: due_at_iso8601(retry.due_in_ms),
       error: retry.error,
       worker_host: Map.get(retry, :worker_host),
@@ -180,6 +185,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp blocked_issue_payload(blocked) do
     %{
       worker_host: Map.get(blocked, :worker_host),
+      issue_url: issue_url_from_entry(blocked),
       workspace_path: Map.get(blocked, :workspace_path),
       session_id: blocked.session_id,
       state: blocked.state,
@@ -204,6 +210,10 @@ defmodule SymphonyElixirWeb.Presenter do
       (blocked && Map.get(blocked, :worker_host))
   end
 
+  defp issue_url_from_entry(%{issue: %{url: url}}), do: url
+  defp issue_url_from_entry(%{issue_url: url}), do: url
+  defp issue_url_from_entry(_entry), do: nil
+
   defp recent_events_payload(nil), do: []
 
   defp recent_events_payload(entry) do
@@ -219,6 +229,71 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  @spec status_payload(GenServer.name(), timeout()) :: map()
+  def status_payload(orchestrator, snapshot_timeout_ms) do
+    generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+    case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
+      %{} = snapshot ->
+        %{
+          generated_at: generated_at,
+          blocked: Enum.map(Map.get(snapshot, :blocked, []), &status_blocked_entry_payload/1),
+          retrying: Enum.map(snapshot.retrying, &status_retry_entry_payload/1),
+          ledger: ledger_payload(Map.get(snapshot, :ledger, %{}))
+        }
+
+      :timeout ->
+        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+
+      :unavailable ->
+        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+    end
+  end
+
+  defp status_blocked_entry_payload(entry) do
+    ledger_entry = ledger_entry(entry.issue_id)
+
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      blocked_reason: Map.get(ledger_entry, :blocked_reason) || entry.error,
+      token_total: Map.get(ledger_entry, :cumulative_tokens, 0),
+      retry_count: Map.get(ledger_entry, :retries, 0),
+      stall_events: Map.get(ledger_entry, :stall_events, 0),
+      declined_elicitations: Map.get(ledger_entry, :declined_elicitations, 0)
+    }
+  end
+
+  defp status_retry_entry_payload(entry) do
+    ledger_entry = ledger_entry(entry.issue_id)
+
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      retry_count: Map.get(ledger_entry, :retries, entry.attempt || 0),
+      error: entry.error
+    }
+  end
+
+  defp ledger_payload(ledger) when is_map(ledger) do
+    Map.new(ledger, fn {issue_id, entry} -> {issue_id, stringify_keys(entry)} end)
+  end
+
+  defp ledger_payload(_ledger), do: %{}
+
+  defp ledger_entry(issue_id) when is_binary(issue_id) do
+    case SymphonyElixir.Ledger.get(issue_id) do
+      entry when is_map(entry) -> entry
+      _ -> %{}
+    end
+  end
+
+  defp ledger_entry(_issue_id), do: %{}
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {key, value} -> {to_string(key), value} end)
+  end
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

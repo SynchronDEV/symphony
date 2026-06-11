@@ -50,8 +50,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:required_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+      field(:delta_polling, :boolean, default: true)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -59,9 +61,14 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :required_labels, :active_states, :terminal_states, :delta_polling],
         empty_values: []
       )
+      |> update_change(:required_labels, fn labels ->
+        labels
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+        |> Enum.uniq()
+      end)
     end
   end
 
@@ -91,12 +98,18 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:mirror_path, :string)
+      field(:env, :map, default: %{})
+      field(:max_total_gb, :float)
+      field(:keep_last_n, :integer, default: 5)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :mirror_path, :env, :max_total_gb, :keep_last_n], empty_values: [])
+      |> validate_number(:max_total_gb, greater_than: 0)
+      |> validate_number(:keep_last_n, greater_than_or_equal_to: 0)
     end
   end
 
@@ -131,7 +144,11 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
+      field(:max_tokens_per_issue, :integer)
+      field(:max_dispatch_attempts, :integer)
+      field(:max_rework_cycles, :integer)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:prompt_template_by_state, :map, default: %{})
       field(:stop_continue_labels, {:array, :string}, default: [])
     end
 
@@ -144,7 +161,11 @@ defmodule SymphonyElixir.Config.Schema do
           :max_concurrent_agents,
           :max_turns,
           :max_retry_backoff_ms,
+          :max_tokens_per_issue,
+          :max_dispatch_attempts,
+          :max_rework_cycles,
           :max_concurrent_agents_by_state,
+          :prompt_template_by_state,
           :stop_continue_labels
         ],
         empty_values: []
@@ -152,7 +173,11 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> validate_number(:max_tokens_per_issue, greater_than: 0)
+      |> validate_number(:max_dispatch_attempts, greater_than: 0)
+      |> validate_number(:max_rework_cycles, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
+      |> update_change(:prompt_template_by_state, &Schema.normalize_state_templates/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
   end
@@ -181,6 +206,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:elicitation_policy, :string, default: "decline")
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -195,7 +221,8 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :elicitation_policy
         ],
         empty_values: []
       )
@@ -203,6 +230,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_inclusion(:elicitation_policy, ["decline", "block"])
     end
   end
 
@@ -340,6 +368,20 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
+  @spec normalize_state_templates(nil | map()) :: map()
+  def normalize_state_templates(nil), do: %{}
+
+  def normalize_state_templates(templates) when is_map(templates) do
+    Enum.reduce(templates, %{}, fn {state_name, template}, acc ->
+      if is_binary(template) do
+        Map.put(acc, normalize_issue_state(to_string(state_name)), template)
+      else
+        acc
+      end
+    end)
+  end
+
+  @doc false
   @spec validate_state_limits(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
   def validate_state_limits(changeset, field) do
     validate_change(changeset, field, fn ^field, limits ->
@@ -381,7 +423,8 @@ defmodule SymphonyElixir.Config.Schema do
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces")),
+        mirror_path: resolve_optional_path_value(settings.workspace.mirror_path)
     }
 
     codex = %{
@@ -390,7 +433,16 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    agent = %{
+      settings.agent
+      | stop_continue_labels:
+          settings.agent.stop_continue_labels
+          |> List.wrap()
+          |> Kernel.++(["symphony-budget-exceeded", "symphony-stuck"])
+          |> Enum.uniq()
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, agent: agent}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -441,6 +493,11 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_optional_path_value(nil), do: nil
+  defp resolve_optional_path_value(""), do: nil
+  defp resolve_optional_path_value(value) when is_binary(value), do: resolve_path_value(value, nil)
+  defp resolve_optional_path_value(_value), do: nil
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do

@@ -55,4 +55,35 @@ defmodule SymphonyElixir.Linear.Issue do
   end
 
   def stop_continue_labeled?(_issue, _stop_labels), do: false
+
+  @doc """
+  Returns true when the issue is assigned to this worker and carries every
+  configured required label.
+  """
+  @spec routable?(t(), [String.t()]) :: boolean()
+  def routable?(%__MODULE__{assigned_to_worker: false}, _required_labels), do: false
+
+  def routable?(%__MODULE__{labels: labels}, required_labels)
+      when is_list(labels) and is_list(required_labels) do
+    normalized_labels =
+      labels
+      |> Enum.map(&normalize_label/1)
+      |> Enum.reject(&(&1 == ""))
+      |> MapSet.new()
+
+    required_labels
+    |> Enum.map(&normalize_label/1)
+    |> Enum.all?(&MapSet.member?(normalized_labels, &1))
+  end
+
+  def routable?(%__MODULE__{}, required_labels) when required_labels in [[], nil], do: true
+  def routable?(_issue, _required_labels), do: false
+
+  defp normalize_label(label) when is_binary(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_label(_label), do: ""
 end

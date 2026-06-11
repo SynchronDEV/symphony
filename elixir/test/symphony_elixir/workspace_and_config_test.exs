@@ -458,6 +458,77 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client retries structured Linear rate limit responses" do
+    parent = self()
+    reset_at = DateTime.utc_now() |> DateTime.add(-1, :second) |> DateTime.to_unix()
+
+    request_fun = fn _payload, _headers ->
+      call_count = Process.get(:linear_rate_limit_request_count, 0) + 1
+      Process.put(:linear_rate_limit_request_count, call_count)
+      send(parent, {:linear_request, call_count})
+
+      case call_count do
+        1 ->
+          {:ok,
+           %{
+             status: 400,
+             headers: %{
+               "x-ratelimit-requests-remaining" => ["0"],
+               "x-ratelimit-requests-reset" => [Integer.to_string(reset_at)]
+             },
+             body: %{
+               "errors" => [
+                 %{
+                   "message" => "Rate limit exceeded",
+                   "extensions" => %{"code" => "RATELIMITED"}
+                 }
+               ]
+             }
+           }}
+
+        _ ->
+          {:ok, %{status: 200, headers: %{"x-ratelimit-requests-remaining" => ["2499"]}, body: %{"data" => %{}}}}
+      end
+    end
+
+    assert {:ok, %{"data" => %{}}} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               request_fun: request_fun,
+               sleep_fun: fn ms -> send(parent, {:linear_rate_limit_sleep, ms}) end
+             )
+
+    assert_receive {:linear_request, 1}
+    assert_receive {:linear_rate_limit_sleep, 0}
+    assert_receive {:linear_request, 2}
+  end
+
+  test "linear client returns structured rate limit errors after retries are exhausted" do
+    reset_at = DateTime.utc_now() |> DateTime.add(-1, :second) |> DateTime.to_unix()
+
+    assert {:error, {:rate_limited, %DateTime{}}} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               rate_limit_retries: 0,
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 400,
+                    headers: %{
+                      "x-ratelimit-requests-remaining" => ["0"],
+                      "x-ratelimit-requests-reset" => [Integer.to_string(reset_at)]
+                    },
+                    body: %{
+                      "errors" => [
+                        %{
+                          "message" => "Rate limit exceeded",
+                          "extensions" => %{"code" => "RATELIMITED"}
+                        }
+                      ]
+                    }
+                  }}
+               end
+             )
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",
@@ -536,6 +607,43 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     }
 
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "linear issue routing requires every configured label" do
+    issue = %Issue{labels: [" Symphony ", "JavaScript"], assigned_to_worker: true}
+
+    assert Issue.routable?(issue, [])
+    assert Issue.routable?(issue, ["symphony"])
+    assert Issue.routable?(issue, ["SYMPHONY", "javascript"])
+    refute Issue.routable?(issue, ["symph"])
+    refute Issue.routable?(issue, [" "])
+    refute Issue.routable?(issue, ["symphony", "security"])
+    refute Issue.routable?(%{issue | assigned_to_worker: false}, ["symphony"])
+  end
+
+  test "issue without every required label is not dispatch-eligible" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: ["symphony", "javascript"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "unlabeled-1",
+      identifier: "MT-1008",
+      title: "Not opted in",
+      state: "Todo",
+      labels: ["symphony"]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(%{issue | labels: ["Symphony", "JavaScript"]}, state)
   end
 
   test "todo issue with terminal blockers remains dispatch-eligible" do
@@ -637,6 +745,89 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert skipped_issue.identifier == "MT-1012"
     assert "symphony-reviewed-pass" in skipped_issue.labels
+  end
+
+  test "dispatch revalidation and continuation skip after a required label is removed" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
+
+    stale_issue = %Issue{
+      id: "unlabeled-2",
+      identifier: "MT-1009",
+      title: "Initially opted in",
+      state: "Todo",
+      labels: ["symphony"]
+    }
+
+    refreshed_issue = %{stale_issue | labels: []}
+    fetcher = fn ["unlabeled-2"] -> {:ok, [refreshed_issue]} end
+
+    assert {:skip, ^refreshed_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(stale_issue, fetcher)
+
+    assert {:done, ^refreshed_issue} =
+             AgentRunner.continue_with_issue_for_test(stale_issue, fetcher)
+  end
+
+  test "dispatch and rework caps block issues with stuck label and comment" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Rework"],
+      max_dispatch_attempts: 1,
+      max_rework_cycles: 1
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    dispatch_capped_issue = %Issue{
+      id: "dispatch-cap-1",
+      identifier: "MT-1101",
+      title: "Dispatch capped",
+      state: "Todo"
+    }
+
+    rework_capped_issue = %Issue{
+      id: "rework-cap-1",
+      identifier: "MT-1102",
+      title: "Rework capped",
+      state: "Rework"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      dispatch_capped_issue,
+      rework_capped_issue
+    ])
+
+    base_state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    SymphonyElixir.Ledger.put(dispatch_capped_issue.id, %{dispatch_count: 1})
+
+    dispatch_blocked_state =
+      Orchestrator.dispatch_issue_for_test(dispatch_capped_issue, base_state)
+
+    assert %{error: "symphony-stuck: max_dispatch_attempts=1" <> _} =
+             dispatch_blocked_state.blocked[dispatch_capped_issue.id]
+
+    assert_receive {:memory_tracker_label, "dispatch-cap-1", "symphony-stuck"}
+    assert_receive {:memory_tracker_comment, "dispatch-cap-1", dispatch_comment}
+    assert dispatch_comment =~ "max_dispatch_attempts=1"
+
+    SymphonyElixir.Ledger.put(rework_capped_issue.id, %{rework_count: 1})
+
+    rework_blocked_state =
+      Orchestrator.dispatch_issue_for_test(rework_capped_issue, base_state)
+
+    assert %{error: "symphony-stuck: max_rework_cycles=1" <> _} =
+             rework_blocked_state.blocked[rework_capped_issue.id]
+
+    assert_receive {:memory_tracker_label, "rework-cap-1", "symphony-stuck"}
+    assert_receive {:memory_tracker_comment, "rework-cap-1", rework_comment}
+    assert rework_comment =~ "max_rework_cycles=1"
   end
 
   test "workspace remove returns error information for missing directory" do

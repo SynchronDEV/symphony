@@ -5,7 +5,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, IssueStateBatcher, Linear.Issue, PromptBuilder, Workspace}
+
+  @issue_refresh_attempts 5
+  @issue_refresh_retry_ms 1_000
 
   @type worker_host :: String.t() | nil
 
@@ -24,6 +27,14 @@ defmodule SymphonyElixir.AgentRunner do
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
+  end
+
+  @doc false
+  @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
+          {:continue, Issue.t()} | {:done, Issue.t()} | {:pause, Issue.t(), term()} | {:error, term()}
+  def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
+      when is_function(issue_state_fetcher, 1) do
+    continue_with_issue?(issue, issue_state_fetcher)
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
@@ -78,7 +89,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &IssueStateBatcher.fetch_issue_states_by_ids/1)
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
@@ -92,41 +103,72 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
-    with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+    case AppServer.run_turn(
+           app_session,
+           prompt,
+           issue,
+           on_message: codex_message_handler(codex_update_recipient, issue)
+         ) do
+      {:ok, turn_session} ->
+        Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+        case continue_with_issue?(issue, issue_state_fetcher) do
+          {:continue, refreshed_issue} when turn_number < max_turns ->
+            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+            do_run_codex_turns(
+              app_session,
+              workspace,
+              refreshed_issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              turn_number + 1,
+              max_turns
+            )
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          {:continue, refreshed_issue} ->
+            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          :ok
+            :ok
 
-        {:done, _refreshed_issue} ->
-          :ok
+          {:done, _refreshed_issue} ->
+            :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+          {:pause, paused_issue, reason} ->
+            resume_after_issue_refresh_pause(
+              app_session,
+              workspace,
+              paused_issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              turn_number,
+              max_turns,
+              reason
+            )
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, timeout_reason} when timeout_reason in [:turn_timeout, :stall_timeout] and turn_number < max_turns ->
+        Logger.warning("Codex turn #{timeout_reason_for_log(timeout_reason)} for #{issue_context(issue)}; interrupting thread and continuing on same session turn=#{turn_number}/#{max_turns}")
+        _ = AppServer.interrupt_thread(app_session)
+
+        do_run_codex_turns(
+          app_session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          put_timeout_previous_attempt(opts, turn_number),
+          issue_state_fetcher,
+          turn_number + 1,
+          max_turns
+        )
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -144,8 +186,91 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
+  defp put_timeout_previous_attempt(opts, turn_number) do
+    Keyword.put(opts, :previous_attempt, %{
+      "last_agent_message" => "Previous turn timed out and was interrupted by Symphony.",
+      "dirty_files" => [],
+      "commits_ahead" => nil,
+      "turns_used" => turn_number,
+      "token_total" => nil
+    })
+  end
+
+  defp timeout_reason_for_log(:stall_timeout), do: "stalled"
+  defp timeout_reason_for_log(:turn_timeout), do: "timed out"
+
+  defp resume_after_issue_refresh_pause(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns,
+         reason
+       ) do
+    emit_issue_refresh_paused(codex_update_recipient, issue, reason)
+    sleep_for_issue_pause(reason)
+
+    case continue_with_issue?(issue, issue_state_fetcher) do
+      {:continue, refreshed_issue} when turn_number < max_turns ->
+        Logger.info("Resuming paused agent run for #{issue_context(refreshed_issue)} on same Codex session turn=#{turn_number}/#{max_turns}")
+
+        do_run_codex_turns(
+          app_session,
+          workspace,
+          refreshed_issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          turn_number + 1,
+          max_turns
+        )
+
+      {:continue, refreshed_issue} ->
+        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} after paused issue refresh; returning control to orchestrator")
+        :ok
+
+      {:done, _refreshed_issue} ->
+        :ok
+
+      {:pause, paused_issue, pause_reason} ->
+        resume_after_issue_refresh_pause(
+          app_session,
+          workspace,
+          paused_issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          turn_number,
+          max_turns,
+          pause_reason
+        )
+
+      {:error, refresh_reason} ->
+        {:error, refresh_reason}
+    end
+  end
+
+  defp emit_issue_refresh_paused(recipient, %Issue{} = issue, reason) do
+    send_codex_update(recipient, issue, %{
+      event: :issue_state_refresh_paused,
+      timestamp: DateTime.utc_now(),
+      message: %{reason: reason}
+    })
+  end
+
+  defp sleep_for_issue_pause({:rate_limited, %DateTime{}} = reason), do: sleep_for_issue_refresh(reason)
+
+  defp sleep_for_issue_pause(_reason) do
+    Config.settings!().polling.interval_ms
+    |> max(@issue_refresh_retry_ms)
+    |> Process.sleep()
+  end
+
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
-    case issue_state_fetcher.([issue_id]) do
+    case fetch_issue_for_continuation(issue, issue_state_fetcher) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         cond do
           not active_issue_state?(refreshed_issue.state) ->
@@ -153,6 +278,11 @@ defmodule SymphonyElixir.AgentRunner do
 
           stop_continue_label?(refreshed_issue) ->
             Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue carries a stop-continue label while still in an active state; returning control to orchestrator")
+
+            {:done, refreshed_issue}
+
+          !issue_routable?(refreshed_issue) ->
+            Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue is no longer routed to this worker")
 
             {:done, refreshed_issue}
 
@@ -164,17 +294,77 @@ defmodule SymphonyElixir.AgentRunner do
         {:done, issue}
 
       {:error, reason} ->
-        {:error, {:issue_state_refresh_failed, reason}}
+        retry_issue_refresh(issue, issue_state_fetcher, 2, reason)
     end
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp fetch_issue_for_continuation(%Issue{id: issue_id}, issue_state_fetcher) when is_binary(issue_id) do
+    issue_state_fetcher.([issue_id])
+  end
+
+  defp retry_issue_refresh(issue, issue_state_fetcher, attempt, last_reason)
+       when attempt <= @issue_refresh_attempts do
+    sleep_for_issue_refresh(last_reason)
+
+    case fetch_issue_for_continuation(issue, issue_state_fetcher) do
+      {:error, reason} ->
+        retry_issue_refresh(issue, issue_state_fetcher, attempt + 1, reason)
+
+      result ->
+        continue_with_refreshed_issue(issue, result)
+    end
+  end
+
+  defp retry_issue_refresh(issue, _issue_state_fetcher, _attempt, last_reason) do
+    Logger.warning("Pausing #{issue_context(issue)} in-place after issue-state refresh failed repeatedly: #{inspect(last_reason)}")
+    {:pause, issue, last_reason}
+  end
+
+  defp sleep_for_issue_refresh({:rate_limited, %DateTime{} = reset_at}) do
+    reset_at
+    |> DateTime.diff(DateTime.utc_now(), :millisecond)
+    |> max(@issue_refresh_retry_ms)
+    |> Process.sleep()
+  end
+
+  defp sleep_for_issue_refresh(_reason), do: Process.sleep(@issue_refresh_retry_ms)
+
+  defp continue_with_refreshed_issue(_issue, {:ok, [%Issue{} = refreshed_issue | _]}) do
+    cond do
+      not active_issue_state?(refreshed_issue.state) ->
+        {:done, refreshed_issue}
+
+      stop_continue_label?(refreshed_issue) ->
+        Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue carries a stop-continue label while still in an active state; returning control to orchestrator")
+
+        {:done, refreshed_issue}
+
+      !issue_routable?(refreshed_issue) ->
+        Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue is no longer routed to this worker")
+
+        {:done, refreshed_issue}
+
+      true ->
+        {:continue, refreshed_issue}
+    end
+  end
+
+  defp continue_with_refreshed_issue(issue, {:ok, []}), do: {:done, issue}
+  defp continue_with_refreshed_issue(_issue, {:error, reason}), do: {:error, {:issue_state_refresh_failed, reason}}
 
   defp stop_continue_label?(%Issue{} = issue) do
     Issue.stop_continue_labeled?(issue, Config.settings!().agent.stop_continue_labels)
   end
 
   defp stop_continue_label?(_issue), do: false
+
+  defp issue_routable?(%Issue{} = issue) do
+    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+  end
+
+  defp issue_routable?(_issue), do: false
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

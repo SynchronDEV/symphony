@@ -5,13 +5,60 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.Linear.RateLimitBudget
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
+  @default_rate_limit_retries 1
 
   @query """
   query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @delta_query """
+  query SymphonyLinearDeltaPoll($projectSlug: String!, $stateNames: [String!]!, $updatedAfter: DateTime!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}, updatedAt: {gt: $updatedAfter}}, first: $first, after: $after) {
       nodes {
         id
         identifier
@@ -105,6 +152,11 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
+    fetch_candidate_issues(nil)
+  end
+
+  @spec fetch_candidate_issues(DateTime.t() | nil) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_candidate_issues(updated_after) do
     tracker = Config.settings!().tracker
     project_slug = tracker.project_slug
 
@@ -117,7 +169,7 @@ defmodule SymphonyElixir.Linear.Client do
 
       true ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
+          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter, updated_after)
         end
     end
   end
@@ -140,7 +192,7 @@ defmodule SymphonyElixir.Linear.Client do
           {:error, :missing_linear_project_slug}
 
         true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+          do_fetch_by_states(project_slug, normalized_states, nil, nil)
       end
     end
   end
@@ -164,24 +216,7 @@ defmodule SymphonyElixir.Linear.Client do
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
-    request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
-
-    with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
-    else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
-
-        {:error, {:linear_api_status, response.status}}
-
-      {:error, reason} ->
-        Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
-        {:error, {:linear_api_request, reason}}
-    end
+    do_graphql_request(payload, opts, Keyword.get(opts, :rate_limit_retries, @default_rate_limit_retries))
   end
 
   @doc false
@@ -236,25 +271,21 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  defp do_fetch_by_states(project_slug, state_names, assignee_filter, updated_after) do
+    do_fetch_by_states_page(project_slug, state_names, assignee_filter, updated_after, nil, [])
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, updated_after, after_cursor, acc_issues) do
+    {query, variables} = poll_query_and_variables(project_slug, state_names, updated_after, after_cursor)
+
     with {:ok, body} <-
-           graphql(@query, %{
-             projectSlug: project_slug,
-             stateNames: state_names,
-             first: @issue_page_size,
-             relationFirst: @issue_page_size,
-             after: after_cursor
-           }),
+           graphql(query, variables, critical?: false),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(project_slug, state_names, assignee_filter, updated_after, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -263,6 +294,29 @@ defmodule SymphonyElixir.Linear.Client do
           {:error, reason}
       end
     end
+  end
+
+  defp poll_query_and_variables(project_slug, state_names, %DateTime{} = updated_after, after_cursor) do
+    {@delta_query,
+     %{
+       projectSlug: project_slug,
+       stateNames: state_names,
+       updatedAfter: DateTime.to_iso8601(updated_after),
+       first: @issue_page_size,
+       relationFirst: @issue_page_size,
+       after: after_cursor
+     }}
+  end
+
+  defp poll_query_and_variables(project_slug, state_names, _updated_after, after_cursor) do
+    {@query,
+     %{
+       projectSlug: project_slug,
+       stateNames: state_names,
+       first: @issue_page_size,
+       relationFirst: @issue_page_size,
+       after: after_cursor
+     }}
   end
 
   defp prepend_page_issues(issues, acc_issues) when is_list(issues) and is_list(acc_issues) do
@@ -357,6 +411,80 @@ defmodule SymphonyElixir.Linear.Client do
 
     operation_name <> " body=" <> body
   end
+
+  defp do_graphql_request(payload, opts, retries_left) when is_map(payload) and is_integer(retries_left) do
+    request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
+    sleep_fun = Keyword.get(opts, :sleep_fun, &Process.sleep/1)
+
+    if Keyword.get(opts, :critical?, true) == false and RateLimitBudget.low?() do
+      RateLimitBudget.delay_until_reset(sleep_fun)
+    end
+
+    with {:ok, headers} <- graphql_headers(),
+         {:ok, response} <- request_fun.(payload, headers) do
+      RateLimitBudget.update_from_headers(Map.get(response, :headers))
+      handle_graphql_response(payload, opts, retries_left, response)
+    else
+      {:error, reason} ->
+        Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
+        {:error, {:linear_api_request, reason}}
+    end
+  end
+
+  defp handle_graphql_response(payload, opts, retries_left, %{status: 200, body: body}) do
+    if rate_limited_body?(body) do
+      retry_or_rate_limited(payload, opts, retries_left)
+    else
+      {:ok, body}
+    end
+  end
+
+  defp handle_graphql_response(payload, opts, retries_left, %{status: status, body: body} = response) do
+    cond do
+      rate_limited_status?(status) or rate_limited_body?(body) ->
+        retry_or_rate_limited(payload, opts, retries_left)
+
+      true ->
+        Logger.error(
+          "Linear GraphQL request failed status=#{response.status}" <>
+            linear_error_context(payload, response)
+        )
+
+        {:error, {:linear_api_status, response.status}}
+    end
+  end
+
+  defp rate_limited_status?(status), do: status == 429
+
+  defp retry_or_rate_limited(payload, opts, retries_left) do
+    reset_at = RateLimitBudget.reset_at()
+
+    if retries_left > 0 do
+      Logger.warning("Linear GraphQL request rate-limited; retrying after reset_at=#{inspect(reset_at)}")
+      RateLimitBudget.delay_until_reset(Keyword.get(opts, :sleep_fun, &Process.sleep/1))
+      do_graphql_request(payload, opts, retries_left - 1)
+    else
+      {:error, {:rate_limited, reset_at}}
+    end
+  end
+
+  defp rate_limited_body?(%{"errors" => errors}) when is_list(errors) do
+    Enum.any?(errors, &rate_limited_error?/1)
+  end
+
+  defp rate_limited_body?(_body), do: false
+
+  defp rate_limited_error?(%{"extensions" => %{"code" => code}}) when is_binary(code) do
+    String.upcase(code) == "RATELIMITED"
+  end
+
+  defp rate_limited_error?(%{"message" => message}) when is_binary(message) do
+    message
+    |> String.downcase()
+    |> String.contains?("rate limit")
+  end
+
+  defp rate_limited_error?(_error), do: false
 
   defp summarize_error_body(body) when is_binary(body) do
     body
@@ -542,7 +670,7 @@ defmodule SymphonyElixir.Linear.Client do
     labels
     |> Enum.map(& &1["name"])
     |> Enum.reject(&is_nil/1)
-    |> Enum.map(&String.downcase/1)
+    |> Enum.map(&(String.trim(&1) |> String.downcase()))
   end
 
   defp extract_labels(_), do: []

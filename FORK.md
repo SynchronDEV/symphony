@@ -13,25 +13,22 @@ fixes the failure modes we hit running it continuously.
   (observed: one issue burned ~47M tokens re-reviewing already-merged code).
 - Auto-decline MCP elicitation requests — headless agents wedged forever on
   `mcpServer/elicitation/request`; we answer `decline` and emit an event.
-- Hard backoff (≥5 min) for tracker rate-limit retry failures — Linear reports
-  `RATELIMITED` with HTTP 400 and a shared 2500 req/hr window; the stock
-  10s·2ⁿ retry cadence kept the budget pinned at zero (observed: ~44 failed
-  agent runs per issue). NOTE: current detection is a string-match stopgap that
-  treats all 400s as rate limits; superseded by Phase 1 item 2 below.
+- Structured rate-limit handling — Linear reports `RATELIMITED` with HTTP 400
+  and a shared 2500 req/hr window; the client now parses rate-limit headers,
+  sleeps until reset, retries the request itself, and returns structured
+  `{:rate_limited, reset_at}` errors.
 
 ## Roadmap
 
-### Phase 0 — rebase onto upstream #88–#90
+### Phase 0 — reconcile upstream #88–#90 history
 
-`main` is currently based 3 commits behind upstream tip. Upstream #88
-("Require opt-in labels for dispatch", `tracker.required_labels`) is the
-positive mirror of our `stop_continue_labels` and ships its own label
-normalization on the Issue struct plus gating across dispatch / retry /
-reconciliation / continuation. Rebasing conflicts in 4 files
-(agent_runner.ex, linear/issue.ex, core_test.exs,
-workspace_and_config_test.exs). The right resolution is to re-express
-`stop_continue_labels` on top of #88's label plumbing — likely shrinking our
-patch considerably. Do this before any Phase 1 work.
+Upstream #88–#90 have been ported into this fork's working tree: opt-in
+`tracker.required_labels`, dashboard issue links, favicon/static asset
+versioning, and the associated tests are present. The remaining Phase 0 work is
+history reconciliation only: merge or rebase onto `upstream/main` after the
+roadmap implementation is committed, resolving equivalent conflicts in favor of
+the fork's current behavior so future upstream syncs do not replay the same
+conflicts.
 
 ### Phase 1 — stop losing work and money
 

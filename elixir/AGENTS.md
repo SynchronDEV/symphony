@@ -24,6 +24,21 @@ This directory contains the Elixir agent orchestration service that polls Linear
 - Orchestrator behavior is stateful and concurrency-sensitive; preserve retry, reconciliation, and cleanup semantics.
 - Follow `docs/logging.md` for logging conventions and required issue/session context fields.
 
+## Code Map
+
+- Config parsing and defaults: `lib/symphony_elixir/config.ex`, `lib/symphony_elixir/config/schema.ex`.
+- Workflow file loading/cache: `lib/symphony_elixir/workflow.ex`, `lib/symphony_elixir/workflow_store.ex`.
+- Linear/tracker boundary: `lib/symphony_elixir/tracker.ex`, `lib/symphony_elixir/tracker/memory.ex`, `lib/symphony_elixir/linear/client.ex`, `lib/symphony_elixir/linear/adapter.ex`, `lib/symphony_elixir/linear/issue.ex`.
+- Main orchestration loop, retries, reconciliation, status snapshots: `lib/symphony_elixir/orchestrator.ex`.
+- Per-issue execution: `lib/symphony_elixir/agent_runner.ex`.
+- Codex app-server protocol: `lib/symphony_elixir/codex/app_server.ex`, `lib/symphony_elixir/codex/dynamic_tool.ex`.
+- Workspace lifecycle and hooks: `lib/symphony_elixir/workspace.ex`.
+- Prompt rendering: `lib/symphony_elixir/prompt_builder.ex`.
+- Persistent counters/metrics: `lib/symphony_elixir/ledger.ex`.
+- TUI/status dashboard: `lib/symphony_elixir/status_dashboard.ex`.
+- HTTP API and LiveView dashboard: `lib/symphony_elixir/http_server.ex`, `lib/symphony_elixir_web/router.ex`, `lib/symphony_elixir_web/presenter.ex`, `lib/symphony_elixir_web/controllers/observability_api_controller.ex`, `lib/symphony_elixir_web/live/dashboard_live.ex`.
+- CLI and mix tasks: `lib/symphony_elixir/cli.ex`, `lib/mix/tasks/*.ex`.
+
 ## Tests and Validation
 
 Run targeted tests while iterating, then run full gates before handoff.

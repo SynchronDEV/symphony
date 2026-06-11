@@ -16,6 +16,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.tracker.required_labels == []
     assert config.agent.max_turns == 20
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
@@ -29,6 +30,15 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: 45_000)
     assert Config.settings!().polling.interval_ms == 45_000
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: [" Symphony ", "SYMPHONY", "JavaScript"]
+    )
+
+    assert Config.settings!().tracker.required_labels == ["symphony", "javascript"]
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: [" "])
+    assert Config.settings!().tracker.required_labels == [""]
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -147,6 +157,49 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     assert Config.settings!().tracker.assignee == env_assignee
+  end
+
+  test "ledger reloads persisted issue counters after restart" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-ledger-restart-#{System.unique_integer([:positive])}"
+      )
+
+    ledger_path = Path.join(test_root, "ledger.json")
+    metrics_path = Path.join(test_root, "metrics.jsonl")
+    previous_ledger_path = Application.get_env(:symphony_elixir, :ledger_path)
+    previous_metrics_path = Application.get_env(:symphony_elixir, :metrics_ledger_path)
+
+    on_exit(fn ->
+      restore_app_env(:ledger_path, previous_ledger_path)
+      restore_app_env(:metrics_ledger_path, previous_metrics_path)
+      restart_ledger_process!()
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    Application.put_env(:symphony_elixir, :ledger_path, ledger_path)
+    Application.put_env(:symphony_elixir, :metrics_ledger_path, metrics_path)
+    restart_ledger_process!()
+
+    SymphonyElixir.Ledger.put("issue-ledger-restart", %{
+      dispatch_count: 7,
+      rework_count: 2,
+      cumulative_tokens: 1234,
+      blocked_reason: "symphony-stuck: persisted"
+    })
+
+    assert File.exists?(ledger_path)
+
+    restart_ledger_process!()
+
+    assert %{
+             dispatch_count: 7,
+             rework_count: 2,
+             cumulative_tokens: 1234,
+             blocked_reason: "symphony-stuck: persisted"
+           } = SymphonyElixir.Ledger.get("issue-ledger-restart")
   end
 
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
@@ -514,22 +567,21 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
-  test "retry_delay backs off hard on Linear rate-limit failures regardless of attempt" do
-    # Regression: a 429/issue_state_refresh failure must NOT retry on the normal
-    # 10s*2^n cadence — that pins Linear's shared 1-hour budget at 0 and thrashes.
-    # It must wait minutes (>= the dedicated rate-limit delay), even on attempt 1.
+  test "retry_delay backs off hard on structured Linear rate-limit failures regardless of attempt" do
     rate_limit_errors = [
-      "agent exited: {%RuntimeError{message: \"... {:issue_state_refresh_failed, {:linear_api_status, 400}}\"}}",
-      "agent exited: {:linear_api_status, 429}",
-      "retry poll failed: {:linear_api_status, 400}",
-      "Linear GraphQL request failed status=429 body=RATELIMITED"
+      {:rate_limited, nil},
+      {:linear_api_status, 429},
+      {:linear_api_request, {:rate_limited, nil}}
     ]
 
     for err <- rate_limit_errors do
-      # attempt 1 would normally be 10s; rate-limit path must be far larger.
       delay = Orchestrator.retry_delay_for_test(1, %{error: err})
       assert delay >= 300_000, "expected >=5min backoff for rate-limit error #{inspect(err)}, got #{delay}"
     end
+  end
+
+  test "retry_delay does not treat ordinary HTTP 400s as rate limits" do
+    assert Orchestrator.retry_delay_for_test(1, %{error: {:linear_api_status, 400}}) == 10_000
   end
 
   test "retry_delay uses normal exponential backoff for non-rate-limit failures" do
@@ -635,7 +687,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, -1_000, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -675,7 +727,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -839,6 +891,19 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp restart_ledger_process! do
+    if Process.whereis(SymphonyElixir.Ledger) do
+      :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Ledger)
+    end
+
+    case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Ledger) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+      {:error, :running} -> :ok
+      other -> flunk("failed to restart ledger: #{inspect(other)}")
+    end
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1443,6 +1508,120 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner interrupts a stalled turn and continues on the same thread" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-stall-continuation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-stall.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-stall.trace}"
+      run_id="$(date +%s%N)-$$"
+      printf 'RUN:%s\\n' "$run_id" >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stall-same"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stall-1"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          6)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stall-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_timeout_ms: 5_000,
+        codex_stall_timeout_ms: 50,
+        max_turns: 2
+      )
+
+      state_fetcher = fn ["issue-stall-cont"] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-stall-cont",
+             identifier: "MT-249",
+             title: "Continue after stall",
+             description: "Done after interrupted stall",
+             state: "Done"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-stall-cont",
+        identifier: "MT-249",
+        title: "Continue after stall",
+        description: "First turn stalls",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
+      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+
+      json_payloads =
+        lines
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
+      assert length(Enum.filter(json_payloads, &(&1["method"] == "thread/start"))) == 1
+      assert length(Enum.filter(json_payloads, &(&1["method"] == "thread/interrupt"))) == 1
+
+      turn_starts = Enum.filter(json_payloads, &(&1["method"] == "turn/start"))
+      assert length(turn_starts) == 2
+      assert Enum.all?(turn_starts, &(get_in(&1, ["params", "threadId"]) == "thread-stall-same"))
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

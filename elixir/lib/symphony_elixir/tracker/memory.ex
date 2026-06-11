@@ -12,6 +12,17 @@ defmodule SymphonyElixir.Tracker.Memory do
     {:ok, issue_entries()}
   end
 
+  @spec fetch_candidate_issues(DateTime.t() | nil) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_candidate_issues(nil), do: fetch_candidate_issues()
+
+  def fetch_candidate_issues(%DateTime{} = updated_after) do
+    {:ok,
+     Enum.filter(issue_entries(), fn
+       %Issue{updated_at: %DateTime{} = updated_at} -> DateTime.compare(updated_at, updated_after) == :gt
+       _ -> true
+     end)}
+  end
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) do
     normalized_states =
@@ -38,6 +49,12 @@ defmodule SymphonyElixir.Tracker.Memory do
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})
+    :ok
+  end
+
+  @spec apply_label(String.t(), String.t()) :: :ok | {:error, term()}
+  def apply_label(issue_id, label_name) do
+    send_event({:memory_tracker_label, issue_id, label_name})
     :ok
   end
 

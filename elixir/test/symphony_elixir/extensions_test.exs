@@ -15,6 +15,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, [:candidate]}
     end
 
+    def fetch_candidate_issues(updated_after) do
+      send(self(), {:fetch_candidate_issues_called, updated_after})
+      {:ok, [:candidate]}
+    end
+
     def fetch_issues_by_states(states) do
       send(self(), {:fetch_issues_by_states_called, states})
       {:ok, states}
@@ -193,12 +198,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert :ok = SymphonyElixir.Tracker.apply_label("issue-1", "symphony-stuck")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_label, "issue-1", "symphony-stuck"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
+    assert :ok = Memory.apply_label("issue-1", "quiet-label")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
@@ -243,6 +251,33 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "labels" => %{"nodes" => [%{"id" => "existing-label"}]},
+               "team" => %{"labels" => %{"nodes" => [%{"id" => "new-label"}]}}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.apply_label("issue-1", "symphony-stuck")
+    assert_receive {:graphql_called, label_lookup_query, %{issueId: "issue-1", labelName: "symphony-stuck"}}
+    assert label_lookup_query =~ "SymphonyResolveLabelId"
+
+    assert_receive {:graphql_called, label_update_query, %{issueId: "issue-1", labelIds: ["existing-label", "new-label"]}}
+
+    assert label_update_query =~ "SymphonyUpdateIssueLabels"
+
+    Process.put({FakeLinearClient, :graphql_results}, [{:ok, %{"data" => %{"issue" => %{"team" => %{"labels" => %{"nodes" => []}}}}}}])
+    assert {:error, :label_not_found} = Adapter.apply_label("issue-1", "missing-label")
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -319,6 +354,41 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
   end
 
+  test "issue state batcher debounces concurrent callers and preserves request shape" do
+    parent = self()
+    fetch_ref = make_ref()
+
+    fetcher = fn issue_ids ->
+      send(parent, {fetch_ref, :fetch, Enum.sort(issue_ids)})
+
+      {:ok,
+       [
+         %{id: "issue-1", state: "Todo"},
+         %{id: "issue-2", state: "In Progress"},
+         %{id: "issue-3", state: "Review"}
+       ]}
+    end
+
+    batcher_name = :"issue_state_batcher_#{System.unique_integer([:positive])}"
+
+    start_supervised!({SymphonyElixir.IssueStateBatcher, name: batcher_name, fetcher: fetcher, batch_delay_ms: 25})
+
+    first =
+      Task.async(fn ->
+        GenServer.call(batcher_name, {:fetch, ["issue-2", "issue-1"]}, :infinity)
+      end)
+
+    second =
+      Task.async(fn ->
+        GenServer.call(batcher_name, {:fetch, ["issue-3"]}, :infinity)
+      end)
+
+    assert_receive {^fetch_ref, :fetch, ["issue-1", "issue-2", "issue-3"]}
+
+    assert {:ok, [%{id: "issue-2"}, %{id: "issue-1"}]} = Task.await(first)
+    assert {:ok, [%{id: "issue-3"}]} = Task.await(second)
+  end
+
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
@@ -347,6 +417,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
+                 "issue_url" => nil,
                  "state" => "In Progress",
                  "worker_host" => nil,
                  "workspace_path" => nil,
@@ -363,6 +434,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-retry",
                  "issue_identifier" => "MT-RETRY",
+                 "issue_url" => nil,
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
@@ -374,6 +446,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-blocked",
                  "issue_identifier" => "MT-BLOCKED",
+                 "issue_url" => nil,
                  "state" => "In Progress",
                  "error" => "codex turn requires operator input",
                  "worker_host" => "dm-dev2",
@@ -408,6 +481,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
              "running" => %{
                "worker_host" => nil,
+               "issue_url" => nil,
                "workspace_path" => nil,
                "session_id" => "thread-http",
                "turn_count" => 7,
@@ -523,7 +597,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     html = html_response(get(build_conn(), "/"), 200)
-    assert html =~ "/dashboard.css"
+    assert html =~ ~r|/dashboard\.css\?v=[0-9a-f]{12}|
+    assert html =~ ~r|/favicon\.png\?v=[0-9a-f]{12}|
     assert html =~ "/vendor/phoenix_html/phoenix_html.js"
     assert html =~ "/vendor/phoenix/phoenix.js"
     assert html =~ "/vendor/phoenix_live_view/phoenix_live_view.js"
@@ -535,6 +610,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert dashboard_css =~ ".status-badge-live"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
+    assert dashboard_css =~ "text-decoration-thickness: 1px"
+
+    favicon_conn = get(build_conn(), "/favicon.png")
+    assert response(favicon_conn, 200) == File.read!("priv/static/favicon.png")
+    assert Plug.Conn.get_resp_header(favicon_conn, "content-type") == ["image/png; charset=utf-8"]
 
     phoenix_html_js = response(get(build_conn(), "/vendor/phoenix_html/phoenix_html.js"), 200)
     assert phoenix_html_js =~ "phoenix.link.click"

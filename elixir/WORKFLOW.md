@@ -2,6 +2,8 @@
 tracker:
   kind: linear
   project_slug: "symphony-0c79b11b75ea"
+  required_labels: []
+  delta_polling: true
   active_states:
     - Todo
     - In Progress
@@ -17,6 +19,8 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+  mirror_path: ~/code/symphony-mirror.git
+  keep_last_n: 10
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
@@ -28,16 +32,23 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_tokens_per_issue: 2000000
+  max_dispatch_attempts: 8
+  max_rework_cycles: 3
+  stop_continue_labels:
+    - symphony-budget-exceeded
+    - symphony-stuck
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  elicitation_policy: decline
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
 ---
 
-You are working on a Linear ticket `{{ issue.identifier }}`
+You are working on a Linear ticket.
 
 {% if attempt %}
 Continuation context:
@@ -47,20 +58,6 @@ Continuation context:
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
 - Do not end the turn while the issue remains in an active state unless you are blocked by missing required permissions/secrets.
   {% endif %}
-
-Issue context:
-Identifier: {{ issue.identifier }}
-Title: {{ issue.title }}
-Current status: {{ issue.state }}
-Labels: {{ issue.labels }}
-URL: {{ issue.url }}
-
-Description:
-{% if issue.description %}
-{{ issue.description }}
-{% else %}
-No description provided.
-{% endif %}
 
 Instructions:
 
@@ -325,3 +322,30 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
+
+## Current issue payload
+
+You are working on a Linear ticket `{{ issue.identifier }}`
+
+Issue context:
+Identifier: {{ issue.identifier }}
+Title: {{ issue.title }}
+Current status: {{ issue.state }}
+Labels: {{ issue.labels }}
+URL: {{ issue.url }}
+
+{% if previous_attempt %}
+Previous attempt:
+- Last agent message: {{ previous_attempt.last_agent_message }}
+- Dirty files: {{ previous_attempt.dirty_files }}
+- Commits ahead: {{ previous_attempt.commits_ahead }}
+- Turns used: {{ previous_attempt.turns_used }}
+- Token total: {{ previous_attempt.token_total }}
+{% endif %}
+
+Description:
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No description provided.
+{% endif %}

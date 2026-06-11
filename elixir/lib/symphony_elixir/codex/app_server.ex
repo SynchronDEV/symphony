@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_interrupt_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -20,6 +21,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: boolean(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
+          elicitation_policy: String.t(),
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
@@ -54,6 +56,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
+           elicitation_policy: session_policies.elicitation_policy,
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host
@@ -74,6 +77,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
+          elicitation_policy: elicitation_policy,
           thread_id: thread_id,
           workspace: workspace
         },
@@ -104,7 +108,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, elicitation_policy) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -142,6 +146,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
+  end
+
+  @spec interrupt_thread(session()) :: :ok | {:error, term()}
+  def interrupt_thread(%{port: port, thread_id: thread_id}) when is_port(port) and is_binary(thread_id) do
+    send_message(port, %{
+      "method" => "thread/interrupt",
+      "id" => @thread_interrupt_id,
+      "params" => %{"threadId" => thread_id}
+    })
+
+    case await_response(port, @thread_interrupt_id) do
+      {:ok, _result} -> :ok
+      {:error, :response_timeout} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -326,42 +345,46 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, elicitation_policy) do
+    timeout_budget = turn_timeout_budget()
+
     receive_loop(
       port,
       on_message,
-      Config.settings!().codex.turn_timeout_ms,
+      timeout_budget,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      elicitation_policy
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_budget, pending_line, tool_executor, auto_approve_requests, elicitation_policy) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_budget, tool_executor, auto_approve_requests, elicitation_policy)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
           port,
           on_message,
-          timeout_ms,
+          timeout_budget,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          elicitation_policy
         )
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
-        {:error, :turn_timeout}
+      timeout_budget.timeout_ms ->
+        {:error, timeout_budget.reason}
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_budget, tool_executor, auto_approve_requests, elicitation_policy) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -401,9 +424,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload,
           payload_string,
           method,
-          timeout_ms,
+          timeout_budget,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          elicitation_policy
         )
 
       {:ok, payload} ->
@@ -417,10 +441,20 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_budget, "", tool_executor, auto_approve_requests, elicitation_policy)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
+
+        emit_message(
+          on_message,
+          :stream_output,
+          %{
+            payload: payload_string,
+            raw: payload_string
+          },
+          metadata_from_message(port, %{raw: payload_string})
+        )
 
         if protocol_message_candidate?(payload_string) do
           emit_message(
@@ -434,7 +468,19 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_budget, "", tool_executor, auto_approve_requests, elicitation_policy)
+    end
+  end
+
+  defp turn_timeout_budget do
+    settings = Config.settings!().codex
+    turn_timeout_ms = settings.turn_timeout_ms
+    stall_timeout_ms = settings.stall_timeout_ms
+
+    if is_integer(stall_timeout_ms) and stall_timeout_ms > 0 and stall_timeout_ms < turn_timeout_ms do
+      %{timeout_ms: stall_timeout_ms, reason: :stall_timeout}
+    else
+      %{timeout_ms: turn_timeout_ms, reason: :turn_timeout}
     end
   end
 
@@ -457,9 +503,10 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload,
          payload_string,
          method,
-         timeout_ms,
+         timeout_budget,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         elicitation_policy
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -471,7 +518,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            on_message,
            metadata,
            tool_executor,
-           auto_approve_requests
+           auto_approve_requests,
+           elicitation_policy
          ) do
       :input_required ->
         emit_message(
@@ -484,7 +532,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_budget, "", tool_executor, auto_approve_requests, elicitation_policy)
 
       :approval_required ->
         emit_message(
@@ -518,7 +566,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_budget, "", tool_executor, auto_approve_requests, elicitation_policy)
         end
     end
   end
@@ -531,7 +579,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         _elicitation_policy
        ) do
     approve_or_require(
       port,
@@ -553,7 +602,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         _elicitation_policy
        ) do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
@@ -588,7 +638,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         _elicitation_policy
        ) do
     approve_or_require(
       port,
@@ -610,7 +661,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         _elicitation_policy
        ) do
     approve_or_require(
       port,
@@ -632,7 +684,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         _elicitation_policy
        ) do
     approve_or_require(
       port,
@@ -654,7 +707,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         _elicitation_policy
        ) do
     maybe_auto_answer_tool_request_user_input(
       port,
@@ -681,7 +735,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         "decline"
        ) do
     send_message(port, %{"id" => id, "result" => %{"action" => "decline"}})
 
@@ -697,13 +752,28 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_handle_approval_request(
          _port,
+         "mcpServer/elicitation/request",
+         _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         _tool_executor,
+         _auto_approve_requests,
+         "block"
+       ) do
+    :input_required
+  end
+
+  defp maybe_handle_approval_request(
+         _port,
          _method,
          _payload,
          _payload_string,
          _on_message,
          _metadata,
          _tool_executor,
-         _auto_approve_requests
+         _auto_approve_requests,
+         _elicitation_policy
        ) do
     :unhandled
   end

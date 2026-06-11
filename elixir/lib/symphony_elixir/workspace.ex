@@ -10,6 +10,28 @@ defmodule SymphonyElixir.Workspace do
 
   @type worker_host :: String.t() | nil
 
+  @spec ensure_mirror() :: :ok | {:error, term()}
+  def ensure_mirror do
+    case Config.settings!().workspace.mirror_path do
+      mirror_path when is_binary(mirror_path) and mirror_path != "" ->
+        source = File.cwd!()
+
+        cond do
+          not File.dir?(Path.join(source, ".git")) ->
+            :ok
+
+          File.dir?(mirror_path) ->
+            fetch_mirror(mirror_path)
+
+          true ->
+            create_mirror(source, mirror_path)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
@@ -80,8 +102,66 @@ defmodule SymphonyElixir.Workspace do
 
   defp create_workspace(workspace) do
     File.rm_rf!(workspace)
-    File.mkdir_p!(workspace)
-    {:ok, workspace, true}
+
+    case clone_from_mirror(workspace) do
+      :ok ->
+        {:ok, workspace, true}
+
+      :skip ->
+        File.mkdir_p!(workspace)
+        {:ok, workspace, true}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp clone_from_mirror(workspace) do
+    case Config.settings!().workspace.mirror_path do
+      mirror_path when is_binary(mirror_path) and mirror_path != "" ->
+        source = File.cwd!()
+
+        if File.dir?(mirror_path) and File.dir?(Path.join(source, ".git")) do
+          parent = Path.dirname(workspace)
+          File.mkdir_p!(parent)
+
+          case System.cmd("git", ["clone", "--reference", mirror_path, "--dissociate", source, workspace], stderr_to_stdout: true) do
+            {_output, 0} -> :ok
+            {output, status} -> {:error, {:workspace_clone_failed, status, output}}
+          end
+        else
+          :skip
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  defp create_mirror(source, mirror_path) do
+    mirror_path
+    |> Path.dirname()
+    |> File.mkdir_p!()
+
+    case System.cmd("git", ["clone", "--mirror", source, mirror_path], stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        Logger.warning("Workspace mirror clone failed status=#{status} output=#{inspect(sanitize_hook_output_for_log(output))}")
+        {:error, {:workspace_mirror_clone_failed, status, output}}
+    end
+  end
+
+  defp fetch_mirror(mirror_path) do
+    case System.cmd("git", ["-C", mirror_path, "fetch", "--prune"], stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        Logger.warning("Workspace mirror fetch failed status=#{status} output=#{inspect(sanitize_hook_output_for_log(output))}")
+        {:error, {:workspace_mirror_fetch_failed, status, output}}
+    end
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
@@ -161,6 +241,86 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host) do
     :ok
+  end
+
+  @spec enforce_retention() :: :ok
+  def enforce_retention do
+    root = Config.settings!().workspace.root
+
+    with true <- File.dir?(root),
+         {:ok, entries} <- File.ls(root) do
+      workspaces =
+        entries
+        |> Enum.map(&Path.join(root, &1))
+        |> Enum.filter(&File.dir?/1)
+        |> Enum.map(fn path -> {path, modified_time(path), directory_size(path)} end)
+        |> Enum.sort_by(fn {_path, modified_at, _size} -> modified_at end, {:desc, DateTime})
+
+      remove_by_count(workspaces, Config.settings!().workspace.keep_last_n)
+      remove_by_size(workspaces, Config.settings!().workspace.max_total_gb)
+    end
+
+    :ok
+  end
+
+  defp remove_by_count(workspaces, keep_last_n) when is_integer(keep_last_n) and keep_last_n >= 0 do
+    workspaces
+    |> Enum.drop(keep_last_n)
+    |> Enum.each(fn {path, _modified_at, _size} -> remove(path, nil) end)
+  end
+
+  defp remove_by_count(_workspaces, _keep_last_n), do: :ok
+
+  defp remove_by_size(_workspaces, nil), do: :ok
+
+  defp remove_by_size(workspaces, max_total_gb) when is_number(max_total_gb) do
+    max_bytes = trunc(max_total_gb * 1024 * 1024 * 1024)
+
+    {_total, to_remove} =
+      Enum.reduce(workspaces, {0, []}, fn {path, _modified_at, size}, {total, remove_acc} ->
+        next_total = total + size
+
+        if next_total > max_bytes do
+          {total, [path | remove_acc]}
+        else
+          {next_total, remove_acc}
+        end
+      end)
+
+    Enum.each(to_remove, &remove(&1, nil))
+  end
+
+  defp remove_by_size(_workspaces, _max_total_gb), do: :ok
+
+  defp modified_time(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, %{mtime: mtime}} -> DateTime.from_unix!(mtime)
+      _ -> ~U[1970-01-01 00:00:00Z]
+    end
+  end
+
+  defp directory_size(path) do
+    {output, status} = System.cmd("du", ["-sk", path], stderr_to_stdout: true)
+
+    if status == 0 do
+      output
+      |> String.split()
+      |> List.first()
+      |> case do
+        nil ->
+          0
+
+        kb ->
+          case Integer.parse(kb) do
+            {value, _rest} -> value * 1024
+            :error -> 0
+          end
+      end
+    else
+      0
+    end
+  rescue
+    _ -> 0
   end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
@@ -298,7 +458,11 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: workspace_env()
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -319,7 +483,7 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    case run_remote_command(worker_host, remote_env_exports() <> "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -446,6 +610,34 @@ defmodule SymphonyElixir.Workspace do
       nil ->
         Task.shutdown(task, :brutal_kill)
         {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}}
+    end
+  end
+
+  defp workspace_env do
+    Config.settings!().workspace.env
+    |> normalize_env_map()
+  end
+
+  defp normalize_env_map(env) when is_map(env) do
+    Enum.flat_map(env, fn
+      {key, value} when is_binary(key) and is_binary(value) -> [{key, value}]
+      {key, value} when is_binary(key) -> [{key, to_string(value)}]
+      _ -> []
+    end)
+  end
+
+  defp normalize_env_map(_env), do: []
+
+  defp remote_env_exports do
+    case workspace_env() do
+      [] ->
+        ""
+
+      env ->
+        env
+        |> Enum.map(fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
+        |> Enum.join("\n")
+        |> Kernel.<>("\n")
     end
   end
 
