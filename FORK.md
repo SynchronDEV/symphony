@@ -21,6 +21,18 @@ fixes the failure modes we hit running it continuously.
 
 ## Roadmap
 
+### Phase 0 — rebase onto upstream #88–#90
+
+`main` is currently based 3 commits behind upstream tip. Upstream #88
+("Require opt-in labels for dispatch", `tracker.required_labels`) is the
+positive mirror of our `stop_continue_labels` and ships its own label
+normalization on the Issue struct plus gating across dispatch / retry /
+reconciliation / continuation. Rebasing conflicts in 4 files
+(agent_runner.ex, linear/issue.ex, core_test.exs,
+workspace_and_config_test.exs). The right resolution is to re-express
+`stop_continue_labels` on top of #88's label plumbing — likely shrinking our
+patch considerably. Do this before any Phase 1 work.
+
 ### Phase 1 — stop losing work and money
 
 1. **Tracker-read failures must not kill agent runs** (`agent_runner.ex`).
