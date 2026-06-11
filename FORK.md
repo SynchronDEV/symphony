@@ -18,6 +18,31 @@ fixes the failure modes we hit running it continuously.
   sleeps until reset, retries the request itself, and returns structured
   `{:rate_limited, reset_at}` errors.
 
+### Hardening pass 2 (2026-06-12, post-roadmap adversarial review)
+
+- `linear_graphql` tool output capped at 16KB with narrow-your-query guidance —
+  uncapped responses were the largest remaining token leak (50KB+ per broad
+  query, persisting in thread context for every later turn).
+- Rate-limit budget gate defaults flipped: all requests are non-critical and
+  wait out a low budget; only adapter mutations/lookups (comments, labels,
+  state transitions) pass `critical?: true`. Previously only the delta poll
+  respected the gate.
+- `delay_until_reset` takes a fallback (60s on the rate-limited retry path)
+  for Linear's empty-headers RATELIMITED responses, which otherwise retried
+  immediately into the same exhausted window.
+- Issue-state batcher call timeout `:infinity` → 30s with structured
+  `:issue_state_batch_timeout` error.
+- Workflow-side: `max_turns` 20 → 40 (a tight turn cap was upstream's only
+  spend bound; `max_tokens_per_issue` now does that job, and every max_turns
+  rollover costs a cold thread).
+
+Known accepted behaviors (reviewed, not bugs): token budget interrupts
+mid-turn by design (overshoot ≤ one notification); max_turns rollover still
+cold-starts a thread (mitigated by previous_attempt + workspace persistence;
+true thread resume blocked on codex app-server support — upstream reverted
+their attempt in #85); ledger grows one entry per issue (negligible at
+current volume).
+
 ## Roadmap
 
 ### Phase 0 — reconcile upstream #88–#90 history
