@@ -514,6 +514,32 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "retry_delay backs off hard on Linear rate-limit failures regardless of attempt" do
+    # Regression: a 429/issue_state_refresh failure must NOT retry on the normal
+    # 10s*2^n cadence — that pins Linear's shared 1-hour budget at 0 and thrashes.
+    # It must wait minutes (>= the dedicated rate-limit delay), even on attempt 1.
+    rate_limit_errors = [
+      "agent exited: {%RuntimeError{message: \"... {:issue_state_refresh_failed, {:linear_api_status, 400}}\"}}",
+      "agent exited: {:linear_api_status, 429}",
+      "retry poll failed: {:linear_api_status, 400}",
+      "Linear GraphQL request failed status=429 body=RATELIMITED"
+    ]
+
+    for err <- rate_limit_errors do
+      # attempt 1 would normally be 10s; rate-limit path must be far larger.
+      delay = Orchestrator.retry_delay_for_test(1, %{error: err})
+      assert delay >= 300_000, "expected >=5min backoff for rate-limit error #{inspect(err)}, got #{delay}"
+    end
+  end
+
+  test "retry_delay uses normal exponential backoff for non-rate-limit failures" do
+    # attempt 1 = 10s base, attempt 2 = 20s — unchanged for ordinary failures.
+    assert Orchestrator.retry_delay_for_test(1, %{error: "agent exited: {:some_other_error}"}) == 10_000
+    assert Orchestrator.retry_delay_for_test(2, %{error: "agent exited: {:some_other_error}"}) == 20_000
+    # continuation first-attempt fast path still applies when not rate-limited.
+    assert Orchestrator.retry_delay_for_test(1, %{delay_type: :continuation}) == 1_000
+  end
+
   test "reconcile stops a running agent when the issue gains a stop-continue label while still active" do
     # Regression: a merged issue that bounces back into an active state (e.g. a
     # reviewing agent re-asserts `In Review` after merge) must not keep its agent

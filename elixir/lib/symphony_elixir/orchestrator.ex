@@ -12,6 +12,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  # Dedicated backoff for tracker (Linear) rate-limit failures. The normal
+  # 10s*2^n backoff is far too aggressive for Linear's 1-hour rolling 2500-req
+  # window: many agents each retrying every 10-40s keep the budget pinned at 0,
+  # so it never recovers (self-perpetuating thrash). A 429/issue_state_refresh
+  # failure means "stop hitting the API", so we wait minutes, not seconds.
+  @rate_limit_retry_ms 300_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -374,6 +380,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
+  end
+
+  @doc false
+  @spec retry_delay_for_test(pos_integer(), map()) :: non_neg_integer()
+  def retry_delay_for_test(attempt, metadata) when is_integer(attempt) and is_map(metadata) do
+    retry_delay(attempt, metadata)
   end
 
   @doc false
@@ -1180,12 +1192,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      # A tracker rate-limit failure must back off hard regardless of attempt
+      # count — retrying it sooner only burns more of the shared budget and
+      # prevents the rolling window from recovering. Take the larger of the
+      # dedicated rate-limit delay and the normal backoff so it never shortens.
+      rate_limited_error?(metadata[:error]) ->
+        max(@rate_limit_retry_ms, failure_retry_delay(attempt))
+
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
+
+  # Recognizes Linear/tracker rate-limit failures from the error string threaded
+  # into retry metadata (e.g. "agent exited: {:issue_state_refresh_failed,
+  # {:linear_api_status, 400}}" or a body containing RATELIMITED / 429).
+  defp rate_limited_error?(error) when is_binary(error) do
+    e = String.downcase(error)
+
+    String.contains?(e, "ratelimit") or
+      String.contains?(e, "rate limit") or
+      String.contains?(e, "issue_state_refresh_failed") or
+      String.contains?(e, "linear_api_status, 400") or
+      String.contains?(e, "linear_api_status, 429") or
+      String.contains?(e, "status=429") or
+      String.contains?(e, "status=400")
+  end
+
+  defp rate_limited_error?(_error), do: false
 
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)
