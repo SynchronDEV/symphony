@@ -8,6 +8,7 @@ defmodule SymphonyElixir.IssueStateBatcher do
   alias SymphonyElixir.Tracker
 
   @batch_delay_ms 25
+  @call_timeout_ms 30_000
 
   defstruct pending: %{},
             pending_ids: MapSet.new(),
@@ -22,16 +23,26 @@ defmodule SymphonyElixir.IssueStateBatcher do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
-  @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
-  def fetch_issue_states_by_ids(issue_ids) when is_list(issue_ids) do
+  @spec fetch_issue_states_by_ids([String.t()], keyword()) :: {:ok, [term()]} | {:error, term()}
+  def fetch_issue_states_by_ids(issue_ids, opts \\ []) when is_list(issue_ids) and is_list(opts) do
     ids = Enum.uniq(issue_ids)
+    server = Keyword.get(opts, :server, __MODULE__)
+    timeout = Keyword.get(opts, :timeout, @call_timeout_ms)
 
     cond do
       ids == [] ->
         {:ok, []}
 
-      Process.whereis(__MODULE__) ->
-        GenServer.call(__MODULE__, {:fetch, ids}, :infinity)
+      Process.whereis(server) ->
+        # A hung batched fetch must not block every waiting caller forever
+        # (previously :infinity). On timeout the caller gets a structured
+        # error and its own retry/pause handling takes over; the batcher's
+        # late reply to a timed-out caller is dropped by the runtime.
+        try do
+          GenServer.call(server, {:fetch, ids}, timeout)
+        catch
+          :exit, {:timeout, _} -> {:error, :issue_state_batch_timeout}
+        end
 
       true ->
         Tracker.fetch_issue_states_by_ids(ids)

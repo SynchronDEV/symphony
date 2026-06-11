@@ -389,6 +389,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [%{id: "issue-3"}]} = Task.await(second)
   end
 
+  test "issue state batcher returns a structured error instead of hanging when the batched fetch stalls" do
+    # Regression: the batcher call used :infinity — a hung tracker fetch
+    # blocked every waiting caller forever. Callers now time out with a
+    # structured error and their own retry/pause handling takes over.
+    fetcher = fn _issue_ids -> Process.sleep(1_000) end
+
+    batcher_name = :"issue_state_batcher_#{System.unique_integer([:positive])}"
+
+    start_supervised!({SymphonyElixir.IssueStateBatcher, name: batcher_name, fetcher: fetcher, batch_delay_ms: 1})
+
+    assert {:error, :issue_state_batch_timeout} =
+             SymphonyElixir.IssueStateBatcher.fetch_issue_states_by_ids(["issue-1"],
+               server: batcher_name,
+               timeout: 100
+             )
+  end
+
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
