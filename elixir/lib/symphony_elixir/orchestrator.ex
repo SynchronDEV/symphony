@@ -1944,6 +1944,11 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_last_reported_cached_input_tokens:
+          max(
+            Map.get(running_entry, :codex_last_reported_cached_input_tokens, 0),
+            token_delta.cached_input_reported
+          ),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -2182,17 +2187,25 @@ defmodule SymphonyElixir.Orchestrator do
         :total,
         usage,
         :codex_last_reported_total_tokens
+      ),
+      compute_token_delta(
+        running_entry,
+        :cached_input,
+        usage,
+        :codex_last_reported_cached_input_tokens
       )
     }
     |> Tuple.to_list()
-    |> then(fn [input, output, total] ->
+    |> then(fn [input, output, total, cached_input] ->
       %{
         input_tokens: input.delta,
         output_tokens: output.delta,
         total_tokens: total.delta,
+        cached_input_tokens: cached_input.delta,
         input_reported: input.reported,
         output_reported: output.reported,
-        total_reported: total.reported
+        total_reported: total.reported,
+        cached_input_reported: cached_input.reported
       }
     end)
   end
@@ -2429,6 +2442,26 @@ defmodule SymphonyElixir.Orchestrator do
         :total,
         "totalTokens",
         :totalTokens
+      ])
+
+  # Cached prompt-prefix reads. Codex reports these inside the input total;
+  # they cost ~0 but dominate the raw numbers (a healthy turn re-reads its
+  # full context every model call). The ledger budget subtracts them so
+  # max_tokens_per_issue measures real spend. Absent field → delta 0 →
+  # budget falls back to counting the raw total (previous behavior).
+  defp get_token_usage(usage, :cached_input),
+    do:
+      payload_get(usage, [
+        "cached_input_tokens",
+        :cached_input_tokens,
+        "cachedInputTokens",
+        :cachedInputTokens,
+        "cached_input",
+        :cached_input,
+        "cachedInput",
+        :cachedInput,
+        "cache_read_input_tokens",
+        :cache_read_input_tokens
       ])
 
   defp payload_get(payload, fields) when is_list(fields) do

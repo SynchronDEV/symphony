@@ -60,7 +60,13 @@ defmodule SymphonyElixir.Ledger do
 
   @spec add_tokens(issue_id(), map()) :: issue_entry()
   def add_tokens(issue_id, token_delta) when is_binary(issue_id) and is_map(token_delta) do
-    increment(issue_id, :cumulative_tokens, Map.get(token_delta, :total_tokens, 0))
+    total = Map.get(token_delta, :total_tokens, 0)
+    cached_input = Map.get(token_delta, :cached_input_tokens, 0)
+
+    # Budget measures real spend: cached prompt-prefix reads are reported
+    # inside the totals but cost ~0, so subtract them. Payloads without a
+    # cached field yield cached_input 0 and the previous raw-total behavior.
+    increment(issue_id, :cumulative_tokens, max(total - cached_input, 0))
   end
 
   @spec put(issue_id(), map()) :: issue_entry()

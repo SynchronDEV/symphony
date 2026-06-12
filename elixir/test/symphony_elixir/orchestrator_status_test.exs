@@ -200,6 +200,126 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert is_integer(completed_state.codex_totals.seconds_running)
   end
 
+  test "token budget counts only uncached spend, excluding cached prefix reads" do
+    # Regression (SYNC-762): codex tokenUsage totals include cached prompt-
+    # prefix re-reads (~10-20x real spend). The budget must subtract the
+    # cached component or healthy issues breach mid-flight; payloads without
+    # a cached field keep the previous raw-total behavior.
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_tokens_per_issue: 10
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-token-budget-cached"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-902",
+      title: "Budget cached exclusion",
+      description: "Cached prefix reads must not count toward the budget",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-902"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :CachedTokenBudgetOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    worker_ref = Process.monitor(worker_pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: worker_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-budget-cached",
+      workspace_path: "/tmp/workspaces/MT-902",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    # 100 raw tokens but 95 cached: billable = 5, under the 10 budget.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_completed,
+         payload: %{
+           method: "turn/completed",
+           usage: %{
+             input_tokens: 95,
+             output_tokens: 5,
+             total_tokens: 100,
+             cached_input_tokens: 95
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
+    assert SymphonyElixir.Ledger.get(issue_id).cumulative_tokens == 5
+
+    # Next absolute report: +102 raw, +93 cached => +9 billable => 14 total,
+    # which breaches the 10 budget on real spend.
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_completed,
+         payload: %{
+           method: "turn/completed",
+           usage: %{
+             input_tokens: 190,
+             output_tokens: 12,
+             total_tokens: 202,
+             cached_input_tokens: 188
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert %{error: "symphony-budget-exceeded: " <> _} = state.blocked[issue_id]
+    assert SymphonyElixir.Ledger.get(issue_id).cumulative_tokens == 14
+
+    assert_receive {:memory_tracker_label, ^issue_id, "symphony-budget-exceeded"}
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}
+    assert comment =~ "Total tokens: 14"
+  end
+
   test "token budget breach blocks running issue with label and comment" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
