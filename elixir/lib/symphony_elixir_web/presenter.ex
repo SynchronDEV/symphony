@@ -48,7 +48,7 @@ defmodule SymphonyElixirWeb.Presenter do
         claim_lease = Enum.find(Map.get(snapshot, :claim_leases, []), &(&1.identifier == issue_identifier))
         expired = Enum.find(Map.get(snapshot, :expired, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) and is_nil(blocked) and is_nil(token_usage) and is_nil(claim_lease) and is_nil(expired) do
+        if issue_entries_empty?([running, retry, blocked, token_usage, claim_lease, expired]) do
           {:error, :issue_not_found}
         else
           {:ok, issue_payload_body(issue_identifier, running, retry, blocked, token_usage, claim_lease, expired)}
@@ -58,6 +58,8 @@ defmodule SymphonyElixirWeb.Presenter do
         {:error, :issue_not_found}
     end
   end
+
+  defp issue_entries_empty?(entries), do: Enum.all?(entries, &is_nil/1)
 
   @spec refresh_payload(GenServer.name()) :: {:ok, map()} | {:error, :unavailable}
   def refresh_payload(orchestrator) do
@@ -347,12 +349,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp ledger_payload(_ledger), do: %{}
 
-  defp ledger_entry(issue_id) when is_binary(issue_id) do
-    case SymphonyElixir.Ledger.get(issue_id) do
-      entry when is_map(entry) -> entry
-      _ -> %{}
-    end
-  end
+  defp ledger_entry(issue_id) when is_binary(issue_id), do: SymphonyElixir.Ledger.get(issue_id)
 
   defp ledger_entry(_issue_id), do: %{}
 

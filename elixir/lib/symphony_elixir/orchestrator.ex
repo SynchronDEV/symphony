@@ -332,13 +332,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> recover_expired_claim_leases(issues)
       |> update_candidate_cache(issues)
       |> drain_slot_queue()
-      |> then(fn state ->
-        if available_slots(state) > 0 do
-          choose_issues_from_cache(state)
-        else
-          state
-        end
-      end)
+      |> dispatch_cached_issues()
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -377,6 +371,14 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
+    end
+  end
+
+  defp dispatch_cached_issues(%State{} = state) do
+    if available_slots(state) > 0 do
+      choose_issues_from_cache(state)
+    else
+      state
     end
   end
 

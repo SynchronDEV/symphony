@@ -382,13 +382,9 @@ defmodule SymphonyElixir.AgentRunner do
     Issue.stop_continue_labeled?(issue, Config.settings!().agent.stop_continue_labels)
   end
 
-  defp stop_continue_label?(_issue), do: false
-
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
-
-  defp issue_routable?(_issue), do: false
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

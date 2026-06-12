@@ -703,6 +703,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
              "running" => nil,
              "retry" => nil,
+             "blocked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
