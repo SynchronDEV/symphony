@@ -135,23 +135,27 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   defp resolve_label_ids(issue_id, label_name) do
-    with {:ok, response} <-
-           client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}, critical?: true),
-         label_id when is_binary(label_id) <-
-           get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
-      existing_label_ids =
-        response
-        |> get_in(["data", "issue", "labels", "nodes"])
-        |> List.wrap()
-        |> Enum.flat_map(fn
-          %{"id" => id} when is_binary(id) -> [id]
-          _ -> []
-        end)
+    case client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}, critical?: true) do
+      {:ok, response} ->
+        case get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
+          label_id when is_binary(label_id) ->
+            existing_label_ids =
+              response
+              |> get_in(["data", "issue", "labels", "nodes"])
+              |> List.wrap()
+              |> Enum.flat_map(fn
+                %{"id" => id} when is_binary(id) -> [id]
+                _ -> []
+              end)
 
-      {:ok, Enum.uniq(existing_label_ids ++ [label_id])}
-    else
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :label_not_found}
+            {:ok, Enum.uniq(existing_label_ids ++ [label_id])}
+
+          _ ->
+            {:error, :label_not_found}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 end

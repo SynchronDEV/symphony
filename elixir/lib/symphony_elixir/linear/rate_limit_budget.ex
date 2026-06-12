@@ -55,7 +55,7 @@ defmodule SymphonyElixir.Linear.RateLimitBudget do
     end
   end
 
-  @spec delay_until_reset((non_neg_integer() -> :ok)) :: :ok
+  @spec delay_until_reset((non_neg_integer() -> :ok), non_neg_integer()) :: :ok
   def delay_until_reset(sleep_fun \\ &Process.sleep/1, fallback_ms \\ 0)
       when is_function(sleep_fun, 1) and is_integer(fallback_ms) and fallback_ms >= 0 do
     case reset_at() do
