@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   @delta_query """
-  query SymphonyLinearDeltaPoll($projectSlug: String!, $stateNames: [String!]!, $updatedAfter: DateTime!, $first: Int!, $relationFirst: Int!, $after: String) {
+  query SymphonyLinearDeltaPoll($projectSlug: String!, $stateNames: [String!]!, $updatedAfter: DateTimeOrDuration!, $first: Int!, $relationFirst: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}, updatedAt: {gt: $updatedAfter}}, first: $first, after: $after) {
       nodes {
         id
