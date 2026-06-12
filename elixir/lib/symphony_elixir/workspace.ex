@@ -12,9 +12,9 @@ defmodule SymphonyElixir.Workspace do
 
   @spec ensure_mirror() :: :ok | {:error, term()}
   def ensure_mirror do
-    case Config.settings!().workspace.mirror_path do
+    case configured_mirror_path() do
       mirror_path when is_binary(mirror_path) and mirror_path != "" ->
-        source = File.cwd!()
+        source = mirror_source_dir()
 
         cond do
           not File.dir?(Path.join(source, ".git")) ->
@@ -116,11 +116,40 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+# The mirror source is the repo the WORKFLOW.md lives in — NOT the BEAM's
+  # cwd. Launchers commonly `cd` to the Symphony install dir before exec (the
+  # escript wrapper does), so File.cwd!() points at symphony itself and the
+  # `.git` check silently skips mirror creation. Fall back to cwd only when
+  # the workflow file's directory is not a git repo.
+  defp mirror_source_dir do
+    workflow_dir =
+      case SymphonyElixir.Workflow.workflow_file_path() do
+        path when is_binary(path) and path != "" -> path |> Path.expand() |> Path.dirname()
+        _ -> nil
+      end
+
+    if is_binary(workflow_dir) and File.dir?(Path.join(workflow_dir, ".git")) do
+      workflow_dir
+    else
+      File.cwd!()
+    end
+  end
+
+  # Config paths like "~/code/spektra-mirror.git" must be expanded before any
+  # File.dir?/git use — a raw tilde never matches an existing directory, so the
+  # mirror would silently never be created or used.
+  defp configured_mirror_path do
+    case Config.settings!().workspace.mirror_path do
+      mirror_path when is_binary(mirror_path) and mirror_path != "" -> Path.expand(mirror_path)
+      other -> other
+    end
+  end
+
   # credo:disable-for-lines:18 Credo.Check.Refactor.Nesting
   defp clone_from_mirror(workspace) do
-    case Config.settings!().workspace.mirror_path do
+    case configured_mirror_path() do
       mirror_path when is_binary(mirror_path) and mirror_path != "" ->
-        source = File.cwd!()
+        source = mirror_source_dir()
 
         if File.dir?(mirror_path) and File.dir?(Path.join(source, ".git")) do
           parent = Path.dirname(workspace)
