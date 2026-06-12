@@ -975,10 +975,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp cap_reached?(_count, _cap), do: false
 
   defp record_dispatch_in_ledger(%Issue{id: issue_id} = issue, worker_host) when is_binary(issue_id) do
+    # Rework counting lives in Ledger.observe_state so the agent runner's
+    # between-turn refreshes count in-run state bounces too (a full
+    # review->rework cycle can happen inside one agent run, invisible to
+    # dispatch-time counting).
+    Ledger.observe_state(issue_id, issue.state)
+
     Ledger.update(issue_id, fn entry ->
       entry
       |> Map.update(:dispatch_count, 1, &increment_integer/1)
-      |> maybe_increment_rework_count(issue)
       |> Map.merge(%{
         identifier: issue.identifier,
         state: issue.state,
@@ -991,19 +996,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp increment_integer(value) when is_integer(value), do: value + 1
   defp increment_integer(_value), do: 1
-
-  defp maybe_increment_rework_count(entry, %Issue{} = issue) do
-    in_rework? = rework_dispatch?(issue)
-
-    entry =
-      if in_rework? and Map.get(entry, :last_rework_state) != true do
-        Map.update(entry, :rework_count, 1, &increment_integer/1)
-      else
-        entry
-      end
-
-    Map.put(entry, :last_rework_state, in_rework?)
-  end
 
   defp rework_dispatch?(%Issue{state: state}) when is_binary(state) do
     normalize_issue_state(state) == "rework"

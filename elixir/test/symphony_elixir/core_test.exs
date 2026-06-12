@@ -202,6 +202,33 @@ defmodule SymphonyElixir.CoreTest do
            } = SymphonyElixir.Ledger.get("issue-ledger-restart")
   end
 
+  test "ledger observe_state counts rework transitions edge-triggered across any observer" do
+    # Regression (SYNC-763): a full review->rework cycle can happen inside one
+    # continuous agent run with zero dispatches, so dispatch-time counting
+    # undercounted and max_rework_cycles never fired (observed: 4 cycles in
+    # one session). observe_state is called from BOTH dispatch and the
+    # runner's between-turn refresh; repeated observations of the same rework
+    # state must not double count.
+    issue_id = "issue-observe-rework-#{System.unique_integer([:positive])}"
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "In Review")
+    assert Map.get(SymphonyElixir.Ledger.get(issue_id), :rework_count, 0) == 0
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "Rework")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 1
+
+    # Same cycle observed again (another refresh, then the dispatch) — no
+    # double count.
+    SymphonyElixir.Ledger.observe_state(issue_id, "Rework")
+    SymphonyElixir.Ledger.observe_state(issue_id, "rework")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 1
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "Agent In Progress")
+    SymphonyElixir.Ledger.observe_state(issue_id, "In Review")
+    SymphonyElixir.Ledger.observe_state(issue_id, "Rework")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 2
+  end
+
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
     original_workflow_path = Workflow.workflow_file_path()
 

@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, IssueStateBatcher, Linear.Issue, PromptBuilder, Workspace}
+  alias SymphonyElixir.{Config, IssueStateBatcher, Ledger, Linear.Issue, PromptBuilder, Workspace}
 
   @issue_refresh_attempts 5
   @issue_refresh_retry_ms 1_000
@@ -274,6 +274,12 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case fetch_issue_for_continuation(issue, issue_state_fetcher) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
+        # Count rework transitions here too: a full review->rework cycle can
+        # happen INSIDE one continuous run with zero dispatches, so
+        # dispatch-time counting alone lets issues thrash past
+        # max_rework_cycles (observed: 4 cycles in one session).
+        Ledger.observe_state(issue_id, refreshed_issue.state)
+
         cond do
           not active_issue_state?(refreshed_issue.state) ->
             {:done, refreshed_issue}
@@ -285,6 +291,11 @@ defmodule SymphonyElixir.AgentRunner do
 
           !issue_routable?(refreshed_issue) ->
             Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue is no longer routed to this worker")
+
+            {:done, refreshed_issue}
+
+          rework_cap_exhausted?(refreshed_issue) ->
+            Logger.info("Not continuing #{issue_context(refreshed_issue)}: max_rework_cycles reached; returning control to orchestrator")
 
             {:done, refreshed_issue}
 
@@ -301,6 +312,17 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  # The cap is exhausted once the just-observed rework cycle exceeds it
+  # (observe_state has already counted the current cycle). The run ends and
+  # the orchestrator's dispatch_cap_status blocks the re-dispatch with the
+  # symphony-stuck label.
+  defp rework_cap_exhausted?(%Issue{id: issue_id, state: state}) do
+    cap = Config.settings!().agent.max_rework_cycles
+
+    is_integer(cap) and Ledger.rework_state?(state) and
+      Map.get(Ledger.get(issue_id), :rework_count, 0) > cap
+  end
 
   defp fetch_issue_for_continuation(%Issue{id: issue_id}, issue_state_fetcher) when is_binary(issue_id) do
     issue_state_fetcher.([issue_id])

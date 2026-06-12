@@ -97,6 +97,35 @@ defmodule SymphonyElixir.Ledger do
     end)
   end
 
+  # Edge-triggered rework counter shared by EVERY place an issue state is
+  # observed (orchestrator dispatch AND the agent-runner's between-turn
+  # refresh). Counting only at dispatch undercounts: a whole
+  # implement -> review -> rework cycle can happen inside one continuous
+  # agent run with zero dispatches (observed live: SYNC-705 ran 4 rework
+  # cycles in one session), so the max_rework_cycles cap never fired.
+  @spec observe_state(issue_id(), String.t() | nil) :: issue_entry()
+  def observe_state(issue_id, state) when is_binary(issue_id) do
+    in_rework? = rework_state?(state)
+
+    update(issue_id, fn entry ->
+      entry =
+        if in_rework? and Map.get(entry, :last_rework_state) != true do
+          Map.update(entry, :rework_count, 1, &(&1 + 1))
+        else
+          entry
+        end
+
+      Map.put(entry, :last_rework_state, in_rework?)
+    end)
+  end
+
+  @spec rework_state?(String.t() | nil) :: boolean()
+  def rework_state?(state) when is_binary(state) do
+    state |> String.trim() |> String.downcase() == "rework"
+  end
+
+  def rework_state?(_state), do: false
+
   @spec record_terminal(issue_id(), map()) :: issue_entry()
   def record_terminal(issue_id, attrs) when is_binary(issue_id) and is_map(attrs) do
     entry =
