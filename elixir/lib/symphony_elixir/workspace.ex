@@ -116,7 +116,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-# The mirror source is the repo the WORKFLOW.md lives in — NOT the BEAM's
+  # The mirror source is the repo the WORKFLOW.md lives in — NOT the BEAM's
   # cwd. Launchers commonly `cd` to the Symphony install dir before exec (the
   # escript wrapper does), so File.cwd!() points at symphony itself and the
   # `.git` check silently skips mirror creation. Fall back to cwd only when

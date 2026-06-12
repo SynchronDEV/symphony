@@ -229,6 +229,33 @@ defmodule SymphonyElixir.CoreTest do
     assert SymphonyElixir.Ledger.get(issue_id).rework_count == 2
   end
 
+  test "ledger migrates a legacy cwd-located file to the deployment path once" do
+    # Regression (SYNC-767): the default ledger path used File.cwd!() — the
+    # escript wrapper cd's to the install dir, so deployments silently shared
+    # one ledger there. The deployment path now derives from the workflow
+    # file's directory, with a one-time copy of the legacy file.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-ledger-migrate-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    legacy = Path.join(test_root, "legacy/.symphony/ledger.json")
+    target = Path.join(test_root, "deploy/.symphony/ledger.json")
+    File.mkdir_p!(Path.dirname(legacy))
+    File.write!(legacy, ~s({"issue-migrated":{"dispatch_count":3}}))
+
+    assert :ok = SymphonyElixir.Ledger.maybe_migrate_legacy(target, legacy)
+    assert File.read!(target) =~ "issue-migrated"
+
+    # Second call must not overwrite an existing target.
+    File.write!(target, ~s({"issue-newer":{"dispatch_count":9}}))
+    assert :ok = SymphonyElixir.Ledger.maybe_migrate_legacy(target, legacy)
+    assert File.read!(target) =~ "issue-newer"
+  end
+
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
     original_workflow_path = Workflow.workflow_file_path()
 

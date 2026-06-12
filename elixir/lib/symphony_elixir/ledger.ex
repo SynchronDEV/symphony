@@ -151,11 +151,29 @@ defmodule SymphonyElixir.Ledger do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
       Path.join(System.tmp_dir!(), "symphony_elixir_test_ledger.json")
     else
-      Path.join(File.cwd!(), ".symphony/ledger.json")
+      Path.join(deployment_dir(), ".symphony/ledger.json")
+    end
+  end
+
+  # The ledger belongs to the deployment it describes — the directory the
+  # WORKFLOW.md lives in — NOT the BEAM's cwd. Launchers commonly `cd` to the
+  # Symphony install dir before exec (the escript wrapper does), which would
+  # put the ledger in the install dir and silently SHARE it between
+  # deployments. Same cwd-assumption family as the mirror-source bug.
+  defp deployment_dir do
+    case SymphonyElixir.Workflow.workflow_file_path() do
+      path when is_binary(path) and path != "" ->
+        dir = path |> Path.expand() |> Path.dirname()
+        if File.dir?(dir), do: dir, else: File.cwd!()
+
+      _ ->
+        File.cwd!()
     end
   end
 
   defp load(path) do
+    maybe_migrate_legacy(path)
+
     entries =
       case File.read(path) do
         {:ok, body} ->
@@ -170,6 +188,26 @@ defmodule SymphonyElixir.Ledger do
       end
 
     %{path: path, entries: entries}
+  end
+
+  @doc false
+  @spec maybe_migrate_legacy(Path.t(), Path.t() | nil) :: :ok
+  def maybe_migrate_legacy(path, legacy_path \\ nil) do
+    legacy = legacy_path || Path.join(File.cwd!(), ".symphony/ledger.json")
+
+    if legacy != path and not File.exists?(path) and File.exists?(legacy) do
+      File.mkdir_p!(Path.dirname(path))
+
+      case File.cp(legacy, path) do
+        :ok ->
+          Logger.info("Migrated Symphony ledger from legacy cwd location #{legacy} to #{path}")
+
+        {:error, reason} ->
+          Logger.warning("Failed to migrate legacy Symphony ledger #{legacy} -> #{path}: #{inspect(reason)}")
+      end
+    end
+
+    :ok
   end
 
   defp decode_entries(body) when is_binary(body) do
