@@ -429,6 +429,50 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client counts rework transitions from paginated issue history" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_issue_history_page, query, variables})
+
+      nodes =
+        case variables.after do
+          nil ->
+            [
+              %{"toState" => %{"name" => "Agent In Progress"}},
+              %{"toState" => %{"name" => "Rework"}},
+              %{"toState" => %{"name" => " rework "}}
+            ]
+
+          "cursor-1" ->
+            [
+              %{"toState" => %{"name" => "In Review"}},
+              %{"toState" => %{"name" => "Rework"}},
+              %{"toState" => nil}
+            ]
+        end
+
+      {:ok,
+       %{
+         "data" => %{
+           "issue" => %{
+             "history" => %{
+               "nodes" => nodes,
+               "pageInfo" => %{
+                 "hasNextPage" => variables.after == nil,
+                 "endCursor" => if(variables.after == nil, do: "cursor-1", else: nil)
+               }
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:ok, 3} = Client.fetch_issue_rework_count_for_test("issue-1", graphql_fun)
+
+    assert_receive {:fetch_issue_history_page, query, %{issueId: "issue-1", first: 100, after: nil}}
+    assert query =~ "SymphonyLinearIssueHistory"
+    assert_receive {:fetch_issue_history_page, ^query, %{issueId: "issue-1", first: 100, after: "cursor-1"}}
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -895,6 +939,47 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:memory_tracker_label, "rework-cap-1", "symphony-stuck"}
     assert_receive {:memory_tracker_comment, "rework-cap-1", rework_comment}
     assert rework_comment =~ "max_rework_cycles=1"
+  end
+
+  test "dispatch cap reconciles rework history missed by polling before blocking" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "Agent In Progress", "In Review", "Rework"],
+      max_rework_cycles: 3
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    rework_issue = %Issue{
+      id: "rework-history-cap",
+      identifier: "MT-1103",
+      title: "Fast rework bounces",
+      state: "Rework"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [rework_issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_rework_counts, %{rework_issue.id => 3})
+
+    base_state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    assert Map.get(SymphonyElixir.Ledger.get(rework_issue.id), :rework_count, 0) == 0
+
+    blocked_state = Orchestrator.dispatch_issue_for_test(rework_issue, base_state)
+
+    assert %{error: "symphony-stuck: max_rework_cycles=3 reached after 3 rework cycles"} =
+             blocked_state.blocked[rework_issue.id]
+
+    assert SymphonyElixir.Ledger.get(rework_issue.id).rework_count == 3
+    assert SymphonyElixir.Ledger.get(rework_issue.id).last_rework_state
+    assert_receive {:memory_tracker_label, "rework-history-cap", "symphony-stuck"}
+    assert_receive {:memory_tracker_comment, "rework-history-cap", rework_comment}
+    assert rework_comment =~ "max_rework_cycles=3"
   end
 
   test "workspace remove returns error information for missing directory" do
