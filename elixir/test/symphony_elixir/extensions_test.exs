@@ -30,8 +30,9 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, issue_ids}
     end
 
-    def graphql(query, variables, _opts \\ []) do
+    def graphql(query, variables, opts \\ []) do
       send(self(), {:graphql_called, query, variables})
+      send(self(), {:graphql_called_with_opts, query, variables, opts})
 
       case Process.get({__MODULE__, :graphql_results}) do
         [result | rest] ->
@@ -276,8 +277,64 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert label_update_query =~ "SymphonyUpdateIssueLabels"
 
-    Process.put({FakeLinearClient, :graphql_results}, [{:ok, %{"data" => %{"issue" => %{"team" => %{"labels" => %{"nodes" => []}}}}}}])
-    assert {:error, :label_not_found} = Adapter.apply_label("issue-1", "missing-label")
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "labels" => %{"nodes" => [%{"id" => "existing-label"}]},
+               "team" => %{"id" => "team-1", "labels" => %{"nodes" => []}}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueLabelCreate" => %{"success" => true}}}},
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "labels" => %{"nodes" => [%{"id" => "existing-label"}]},
+               "team" => %{"id" => "team-1", "labels" => %{"nodes" => [%{"id" => "created-label"}]}}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.apply_label("issue-1", "missing-label")
+    assert_receive {:graphql_called, missing_lookup_query, %{issueId: "issue-1", labelName: "missing-label"}}
+    assert missing_lookup_query =~ "SymphonyResolveLabelId"
+
+    assert_receive {:graphql_called, create_label_query, %{teamId: "team-1", labelName: "missing-label"}}
+    assert create_label_query =~ "issueLabelCreate"
+
+    assert_receive {:graphql_called_with_opts, ^create_label_query, %{teamId: "team-1", labelName: "missing-label"}, [critical?: true]}
+
+    assert_receive {:graphql_called, retry_lookup_query, %{issueId: "issue-1", labelName: "missing-label"}}
+    assert retry_lookup_query =~ "SymphonyResolveLabelId"
+
+    assert_receive {:graphql_called, retry_update_query, %{issueId: "issue-1", labelIds: ["existing-label", "created-label"]}}
+    assert retry_update_query =~ "SymphonyUpdateIssueLabels"
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "labels" => %{"nodes" => []},
+               "team" => %{"id" => "team-1", "labels" => %{"nodes" => []}}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueLabelCreate" => %{"success" => false}}}}
+      ]
+    )
+
+    assert {:error, :issue_label_create_failed} = Adapter.apply_label("issue-1", "still-missing-label")
 
     Process.put(
       {FakeLinearClient, :graphql_results},
