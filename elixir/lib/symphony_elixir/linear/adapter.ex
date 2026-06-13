@@ -31,6 +31,14 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @create_label_mutation """
+  mutation SymphonyCreateIssueLabel($teamId: String!, $labelName: String!) {
+    issueLabelCreate(input: {teamId: $teamId, name: $labelName}) {
+      success
+    }
+  }
+  """
+
   @state_lookup_query """
   query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
     issue(id: $issueId) {
@@ -54,6 +62,7 @@ defmodule SymphonyElixir.Linear.Adapter do
         }
       }
       team {
+        id
         labels(filter: {name: {eq: $labelName}}, first: 1) {
           nodes {
             id
@@ -94,15 +103,32 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @spec apply_label(String.t(), String.t()) :: :ok | {:error, term()}
   def apply_label(issue_id, label_name) when is_binary(issue_id) and is_binary(label_name) do
+    apply_label(issue_id, label_name, retry_on_missing?: true)
+  end
+
+  defp apply_label(issue_id, label_name, retry_on_missing?: retry_on_missing?) do
     with {:ok, label_ids} <- resolve_label_ids(issue_id, label_name),
          {:ok, response} <-
            client_module().graphql(@update_labels_mutation, %{issueId: issue_id, labelIds: label_ids}, critical?: true),
          true <- get_in(response, ["data", "issueUpdate", "success"]) == true do
       :ok
     else
-      false -> {:error, :issue_label_update_failed}
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :issue_label_update_failed}
+      {:error, {:label_not_found, team_id}} when retry_on_missing? and is_binary(team_id) ->
+        with :ok <- create_label(team_id, label_name) do
+          apply_label(issue_id, label_name, retry_on_missing?: false)
+        end
+
+      {:error, {:label_not_found, _team_id}} ->
+        {:error, :label_not_found}
+
+      false ->
+        {:error, :issue_label_update_failed}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :issue_label_update_failed}
     end
   end
 
@@ -138,23 +164,44 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   defp resolve_label_ids(issue_id, label_name) do
-    with {:ok, response} <-
-           client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}, critical?: true),
-         label_id when is_binary(label_id) <-
-           get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
-      existing_label_ids =
-        response
-        |> get_in(["data", "issue", "labels", "nodes"])
-        |> List.wrap()
-        |> Enum.flat_map(fn
-          %{"id" => id} when is_binary(id) -> [id]
-          _ -> []
-        end)
-
-      {:ok, Enum.uniq(existing_label_ids ++ [label_id])}
-    else
+    case client_module().graphql(@label_lookup_query, %{issueId: issue_id, labelName: label_name}, critical?: true) do
+      {:ok, response} -> label_ids_from_response(response)
       {:error, reason} -> {:error, reason}
       _ -> {:error, :label_not_found}
     end
+  end
+
+  defp label_ids_from_response(response) do
+    case get_in(response, ["data", "issue", "team", "labels", "nodes", Access.at(0), "id"]) do
+      label_id when is_binary(label_id) ->
+        existing_label_ids =
+          response |> get_in(["data", "issue", "labels", "nodes"]) |> label_ids_from_nodes()
+
+        {:ok, Enum.uniq(existing_label_ids ++ [label_id])}
+
+      _ ->
+        {:error, {:label_not_found, get_in(response, ["data", "issue", "team", "id"])}}
+    end
+  end
+
+  defp create_label(team_id, label_name) do
+    with {:ok, response} <-
+           client_module().graphql(@create_label_mutation, %{teamId: team_id, labelName: label_name}, critical?: true),
+         true <- get_in(response, ["data", "issueLabelCreate", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :issue_label_create_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :issue_label_create_failed}
+    end
+  end
+
+  defp label_ids_from_nodes(nodes) do
+    nodes
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{"id" => id} when is_binary(id) -> [id]
+      _ -> []
+    end)
   end
 end
