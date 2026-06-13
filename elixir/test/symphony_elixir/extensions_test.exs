@@ -496,7 +496,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "expired" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -542,11 +542,88 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "claim_leases" => [
+               %{
+                 "issue_id" => "issue-http",
+                 "issue_identifier" => "MT-HTTP",
+                 "state" => "active",
+                 "worker_id" => "local:#PID<0.1.0>",
+                 "worker_host" => nil,
+                 "workspace_path" => "/workspaces/MT-HTTP",
+                 "attempt" => 1,
+                 "last_seen_at" => state_payload["claim_leases"] |> Enum.at(0) |> Map.fetch!("last_seen_at"),
+                 "lease_expires_at" => state_payload["claim_leases"] |> Enum.at(0) |> Map.fetch!("lease_expires_at"),
+                 "lease_expires_in_ms" => 90_000,
+                 "retry_due_at" => nil,
+                 "retry_due_in_ms" => nil,
+                 "retry_backoff_ms" => nil,
+                 "error" => nil
+               },
+               %{
+                 "issue_id" => "issue-retry",
+                 "issue_identifier" => "MT-RETRY",
+                 "state" => "retrying",
+                 "worker_id" => "local:#PID<0.2.0>",
+                 "worker_host" => nil,
+                 "workspace_path" => "/workspaces/MT-RETRY",
+                 "attempt" => 2,
+                 "last_seen_at" => state_payload["claim_leases"] |> Enum.at(1) |> Map.fetch!("last_seen_at"),
+                 "lease_expires_at" => state_payload["claim_leases"] |> Enum.at(1) |> Map.fetch!("lease_expires_at"),
+                 "lease_expires_in_ms" => 120_000,
+                 "retry_due_at" => state_payload["claim_leases"] |> Enum.at(1) |> Map.fetch!("retry_due_at"),
+                 "retry_due_in_ms" => 2_000,
+                 "retry_backoff_ms" => 2_000,
+                 "error" => "boom"
+               },
+               %{
+                 "issue_id" => "issue-blocked",
+                 "issue_identifier" => "MT-BLOCKED",
+                 "state" => "blocked",
+                 "worker_id" => "dm-dev2:#PID<0.3.0>",
+                 "worker_host" => "dm-dev2",
+                 "workspace_path" => "/workspaces/MT-BLOCKED",
+                 "attempt" => 1,
+                 "last_seen_at" => state_payload["claim_leases"] |> Enum.at(2) |> Map.fetch!("last_seen_at"),
+                 "lease_expires_at" => state_payload["claim_leases"] |> Enum.at(2) |> Map.fetch!("lease_expires_at"),
+                 "lease_expires_in_ms" => 90_000,
+                 "retry_due_at" => nil,
+                 "retry_due_in_ms" => nil,
+                 "retry_backoff_ms" => nil,
+                 "error" => "codex turn requires operator input"
+               }
+             ],
+             "expired" => [
+               %{
+                 "issue_id" => "issue-expired",
+                 "issue_identifier" => "MT-EXPIRED",
+                 "state" => "expired",
+                 "worker_id" => "local:#PID<0.4.0>",
+                 "worker_host" => nil,
+                 "workspace_path" => "/workspaces/MT-EXPIRED",
+                 "attempt" => 3,
+                 "last_seen_at" => state_payload["expired"] |> List.first() |> Map.fetch!("last_seen_at"),
+                 "lease_expires_at" => state_payload["expired"] |> List.first() |> Map.fetch!("lease_expires_at"),
+                 "lease_expires_in_ms" => -1_000,
+                 "retry_due_at" => nil,
+                 "retry_due_in_ms" => nil,
+                 "retry_backoff_ms" => nil,
+                 "error" => "claim lease expired at 2026-05-29T17:00:00Z; requeueing",
+                 "expired_at" => state_payload["expired"] |> List.first() |> Map.fetch!("expired_at"),
+                 "requeued_at" => state_payload["expired"] |> List.first() |> Map.fetch!("requeued_at")
+               }
+             ],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
                "total_tokens" => 12,
                "seconds_running" => 42.5
+             },
+             "token_usage" => %{
+               "input_tokens" => 0,
+               "output_tokens" => 0,
+               "total_tokens" => 0,
+               "issue_count" => 0,
+               "session_count" => 0
              },
              "rate_limits" => %{"primary" => %{"remaining" => 11}}
            }
@@ -559,7 +636,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "issue_id" => "issue-http",
              "status" => "running",
              "workspace" => %{
-               "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
+               "path" => "/workspaces/MT-HTTP",
                "host" => nil
              },
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
@@ -581,7 +658,25 @@ defmodule SymphonyElixir.ExtensionsTest do
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
-             "tracked" => %{}
+             "tracked" => %{
+               "claim_lease" => %{
+                 "issue_id" => "issue-http",
+                 "issue_identifier" => "MT-HTTP",
+                 "state" => "active",
+                 "worker_id" => "local:#PID<0.1.0>",
+                 "worker_host" => nil,
+                 "workspace_path" => "/workspaces/MT-HTTP",
+                 "attempt" => 1,
+                 "last_seen_at" => issue_payload["tracked"]["claim_lease"]["last_seen_at"],
+                 "lease_expires_at" => issue_payload["tracked"]["claim_lease"]["lease_expires_at"],
+                 "lease_expires_in_ms" => 90_000,
+                 "retry_due_at" => nil,
+                 "retry_due_in_ms" => nil,
+                 "retry_backoff_ms" => nil,
+                 "error" => nil
+               }
+             },
+             "token_usage" => nil
            }
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
@@ -601,6 +696,15 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
            } = json_response(conn, 200)
 
+    conn = get(build_conn(), "/api/v1/MT-EXPIRED")
+
+    assert %{
+             "status" => "expired",
+             "tracked" => %{
+               "expired_claim" => %{"state" => "expired", "error" => "claim lease expired" <> _}
+             }
+           } = json_response(conn, 200)
+
     conn = get(build_conn(), "/api/v1/MT-MISSING")
 
     assert json_response(conn, 404) == %{
@@ -611,6 +715,73 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api serves inactive ledger-backed issue details" do
+    orchestrator_name = Module.concat(__MODULE__, :LedgerBackedIssueOrchestrator)
+    snapshot = static_snapshot() |> Map.put(:running, []) |> Map.put(:retrying, [])
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    ledger_file = Application.fetch_env!(:symphony_elixir, :token_usage_ledger_file)
+
+    SymphonyElixir.TokenUsageLedger.append_observation(
+      %{
+        observed_at: "2026-04-20T10:00:00Z",
+        final: true,
+        issue_id: "issue-done",
+        issue_identifier: "MT-DONE",
+        session_id: "thread-done-turn-done",
+        worker_host: "worker-a",
+        workspace_path: "/tmp/MT-DONE",
+        turn_count: 3,
+        input_tokens: 40,
+        output_tokens: 6,
+        total_tokens: 46,
+        source_event: :session_final
+      },
+      file: ledger_file
+    )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["token_usage"] == %{
+             "input_tokens" => 40,
+             "output_tokens" => 6,
+             "total_tokens" => 46,
+             "issue_count" => 1,
+             "session_count" => 1
+           }
+
+    issue_payload = json_response(get(build_conn(), "/api/v1/MT-DONE"), 200)
+
+    assert issue_payload == %{
+             "issue_identifier" => "MT-DONE",
+             "issue_id" => "issue-done",
+             "status" => "inactive",
+             "workspace" => %{"path" => "/tmp/MT-DONE", "host" => "worker-a"},
+             "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
+             "running" => nil,
+             "retry" => nil,
+             "blocked" => nil,
+             "logs" => %{"codex_session_logs" => []},
+             "recent_events" => [],
+             "last_error" => nil,
+             "tracked" => %{},
+             "token_usage" => %{
+               "input_tokens" => 40,
+               "output_tokens" => 6,
+               "total_tokens" => 46,
+               "session_count" => 1
+             }
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -735,6 +906,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
+    assert html =~ "MT-EXPIRED"
+    assert html =~ "Claim leases"
+    assert html =~ "Expired leases"
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
@@ -835,7 +1009,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1, "expired" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -878,6 +1052,8 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp static_snapshot do
+    now = DateTime.utc_now()
+
     %{
       running: [
         %{
@@ -893,7 +1069,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
-          started_at: DateTime.utc_now()
+          started_at: now
         }
       ],
       retrying: [
@@ -914,14 +1090,84 @@ defmodule SymphonyElixir.ExtensionsTest do
           worker_host: "dm-dev2",
           workspace_path: "/workspaces/MT-BLOCKED",
           session_id: "thread-blocked",
-          blocked_at: DateTime.utc_now(),
+          blocked_at: now,
           last_codex_event: :turn_input_required,
           last_codex_message: %{
             event: :turn_input_required,
             message: %{"method" => "turn/input_required"},
-            timestamp: DateTime.utc_now()
+            timestamp: now
           },
-          last_codex_timestamp: DateTime.utc_now()
+          last_codex_timestamp: now
+        }
+      ],
+      claim_leases: [
+        %{
+          issue_id: "issue-http",
+          identifier: "MT-HTTP",
+          state: "active",
+          worker_id: "local:#PID<0.1.0>",
+          worker_host: nil,
+          workspace_path: "/workspaces/MT-HTTP",
+          attempt: 1,
+          last_seen_at: now,
+          lease_expires_at: DateTime.add(now, 90_000, :millisecond),
+          lease_expires_in_ms: 90_000,
+          retry_due_at: nil,
+          retry_due_in_ms: nil,
+          retry_backoff_ms: nil,
+          error: nil
+        },
+        %{
+          issue_id: "issue-retry",
+          identifier: "MT-RETRY",
+          state: "retrying",
+          worker_id: "local:#PID<0.2.0>",
+          worker_host: nil,
+          workspace_path: "/workspaces/MT-RETRY",
+          attempt: 2,
+          last_seen_at: now,
+          lease_expires_at: DateTime.add(now, 120_000, :millisecond),
+          lease_expires_in_ms: 120_000,
+          retry_due_at: DateTime.add(now, 2_000, :millisecond),
+          retry_due_in_ms: 2_000,
+          retry_backoff_ms: 2_000,
+          error: "boom"
+        },
+        %{
+          issue_id: "issue-blocked",
+          identifier: "MT-BLOCKED",
+          state: "blocked",
+          worker_id: "dm-dev2:#PID<0.3.0>",
+          worker_host: "dm-dev2",
+          workspace_path: "/workspaces/MT-BLOCKED",
+          attempt: 1,
+          last_seen_at: now,
+          lease_expires_at: DateTime.add(now, 90_000, :millisecond),
+          lease_expires_in_ms: 90_000,
+          retry_due_at: nil,
+          retry_due_in_ms: nil,
+          retry_backoff_ms: nil,
+          error: "codex turn requires operator input"
+        }
+      ],
+      expired: [
+        %{
+          issue_id: "issue-expired",
+          identifier: "MT-EXPIRED",
+          state: "expired",
+          worker_id: "local:#PID<0.4.0>",
+          worker_host: nil,
+          workspace_path: "/workspaces/MT-EXPIRED",
+          attempt: 3,
+          last_seen_at: DateTime.add(now, -90_000, :millisecond),
+          lease_expires_at: DateTime.add(now, -1_000, :millisecond),
+          lease_expires_in_ms: -1_000,
+          retry_due_at: nil,
+          retry_due_in_ms: nil,
+          retry_backoff_ms: nil,
+          error: "claim lease expired at 2026-05-29T17:00:00Z; requeueing",
+          expired_at: DateTime.add(now, -1_000, :millisecond),
+          requeued_at: now
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},

@@ -31,6 +31,12 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 Linear issue can become a dispatch candidate again after restart.
 
+Claimed issues also get a Symphony claim lease marker through the tracker comment API. The lease
+records the last-seen worker id, workspace path, attempt number, last heartbeat time, and expiry.
+Active workers refresh the lease during poll and Codex activity; retry and blocked transitions
+update the same lease state. If a non-live claim lease expires, Symphony logs the recovery and
+requeues the issue without starting a duplicate worker for a still-running claim.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -85,6 +91,12 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
+Symphony also writes durable Codex token usage observations to `token_usage.jsonl` next to the
+configured log file. With the default log path, this is `./log/token_usage.jsonl`; with
+`--logs-root`, it follows the same log root. The ledger stores cumulative high-water token totals
+per issue/session so completed tickets can still be inspected after the in-memory dashboard state
+has moved on.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
@@ -124,9 +136,11 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
-- When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
-  unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
-  Symphony validation.
+- When `codex.turn_sandbox_policy` is set explicitly, Symphony forwards the configured map to
+  Codex, but for `workspaceWrite` policies it ensures the current issue workspace stays in
+  `writableRoots` at runtime. This allows adding extra writable paths without granting access to
+  sibling workspaces by default. Compatibility for the remaining fields still depends on the
+  targeted Codex app-server version rather than local Symphony validation.
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
@@ -168,9 +182,16 @@ The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
 - JSON API for operational debugging under `/api/v1/*`
+- Active, retrying, blocked, and expired claim lease visibility
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
+
+The JSON API includes durable token summaries from `token_usage.jsonl`:
+
+- `/api/v1/state` includes `token_usage` totals plus issue/session counts.
+- `/api/v1/<issue_identifier>` can return `status: "inactive"` with `token_usage` for a completed
+  or otherwise inactive issue that is no longer present in the live running/retry state.
 
 ## Project Layout
 

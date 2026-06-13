@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, TokenUsageLedger}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -16,12 +16,16 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: length(Map.get(snapshot, :blocked, [])),
+            expired: length(Map.get(snapshot, :expired, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          claim_leases: Enum.map(Map.get(snapshot, :claim_leases, []), &claim_lease_payload/1),
+          expired: Enum.map(Map.get(snapshot, :expired, []), &expired_claim_payload/1),
           codex_totals: snapshot.codex_totals,
+          token_usage: TokenUsageLedger.summary(),
           rate_limits: snapshot.rate_limits
         }
 
@@ -40,17 +44,22 @@ defmodule SymphonyElixirWeb.Presenter do
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
         blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
+        token_usage = TokenUsageLedger.issue_summary(issue_identifier)
+        claim_lease = Enum.find(Map.get(snapshot, :claim_leases, []), &(&1.identifier == issue_identifier))
+        expired = Enum.find(Map.get(snapshot, :expired, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) and is_nil(blocked) do
+        if issue_entries_empty?([running, retry, blocked, token_usage, claim_lease, expired]) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, blocked)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, blocked, token_usage, claim_lease, expired)}
         end
 
       _ ->
         {:error, :issue_not_found}
     end
   end
+
+  defp issue_entries_empty?(entries), do: Enum.all?(entries, &is_nil/1)
 
   @spec refresh_payload(GenServer.name()) :: {:ok, map()} | {:error, :unavailable}
   def refresh_payload(orchestrator) do
@@ -63,14 +72,14 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, blocked) do
+  defp issue_payload_body(issue_identifier, running, retry, blocked, token_usage, claim_lease, expired) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, blocked),
-      status: issue_status(running, retry, blocked),
+      issue_id: issue_id_from_entries(running, retry, blocked, token_usage, claim_lease, expired),
+      status: issue_status(running, retry, blocked, token_usage, expired, claim_lease),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, blocked),
-        host: workspace_host(running, retry, blocked)
+        path: workspace_path(issue_identifier, running, retry, blocked, token_usage, claim_lease, expired),
+        host: workspace_host(running, retry, blocked, token_usage, claim_lease, expired)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -84,20 +93,26 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       recent_events: recent_events_payload(running || blocked),
       last_error: (blocked && blocked.error) || (retry && retry.error),
-      tracked: %{}
+      tracked: tracked_payload(claim_lease, expired),
+      token_usage: token_usage && token_usage_payload(token_usage)
     }
   end
 
-  defp issue_id_from_entries(running, retry, blocked),
-    do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
+  defp issue_id_from_entries(running, retry, blocked, token_usage, claim_lease, expired) do
+    first_entry_value([running, retry, blocked, claim_lease, expired, token_usage], :issue_id)
+  end
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
-  defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
-  defp issue_status(nil, nil, _blocked), do: "blocked"
+  defp issue_status(running, _retry, _blocked, _token_usage, _expired, _claim_lease) when not is_nil(running), do: "running"
+  defp issue_status(nil, retry, _blocked, _token_usage, _expired, _claim_lease) when not is_nil(retry), do: "retrying"
+  defp issue_status(nil, nil, blocked, _token_usage, _expired, _claim_lease) when not is_nil(blocked), do: "blocked"
+  defp issue_status(nil, nil, nil, _token_usage, expired, _claim_lease) when not is_nil(expired), do: "expired"
+  defp issue_status(nil, nil, nil, _token_usage, nil, claim_lease) when not is_nil(claim_lease), do: claim_lease.state || "claimed"
+  defp issue_status(nil, nil, nil, %{}, nil, nil), do: "inactive"
+  defp issue_status(nil, nil, nil, nil, nil, nil), do: "unknown"
 
   defp running_entry_payload(entry) do
     %{
@@ -151,6 +166,35 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp claim_lease_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      state: entry.state,
+      worker_id: entry.worker_id,
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      attempt: entry.attempt,
+      last_seen_at: iso8601(entry.last_seen_at),
+      lease_expires_at: iso8601(entry.lease_expires_at),
+      lease_expires_in_ms: entry.lease_expires_in_ms,
+      retry_due_at: iso8601(entry.retry_due_at),
+      retry_due_in_ms: entry.retry_due_in_ms,
+      retry_backoff_ms: entry.retry_backoff_ms,
+      error: entry.error
+    }
+  end
+
+  defp expired_claim_payload(entry) do
+    entry
+    |> claim_lease_payload()
+    |> Map.merge(%{
+      state: "expired",
+      expired_at: iso8601(entry.expired_at),
+      requeued_at: iso8601(entry.requeued_at)
+    })
+  end
+
   defp running_issue_payload(running) do
     %{
       worker_host: Map.get(running, :worker_host),
@@ -197,17 +241,40 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry, blocked) do
-    (running && Map.get(running, :workspace_path)) ||
-      (retry && Map.get(retry, :workspace_path)) ||
-      (blocked && Map.get(blocked, :workspace_path)) ||
+  defp tracked_payload(nil, nil), do: %{}
+
+  defp tracked_payload(claim_lease, expired) do
+    %{}
+    |> maybe_put(:claim_lease, claim_lease && claim_lease_payload(claim_lease))
+    |> maybe_put(:expired_claim, expired && expired_claim_payload(expired))
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp workspace_path(issue_identifier, running, retry, blocked, token_usage, claim_lease, expired) do
+    first_entry_value([running, retry, blocked, claim_lease, expired, token_usage], :workspace_path) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry, blocked) do
-    (running && Map.get(running, :worker_host)) ||
-      (retry && Map.get(retry, :worker_host)) ||
-      (blocked && Map.get(blocked, :worker_host))
+  defp workspace_host(running, retry, blocked, token_usage, claim_lease, expired) do
+    first_entry_value([running, retry, blocked, claim_lease, expired, token_usage], :worker_host)
+  end
+
+  defp first_entry_value(entries, key) when is_list(entries) do
+    Enum.find_value(entries, fn
+      entry when is_map(entry) -> Map.get(entry, key)
+      _ -> nil
+    end)
+  end
+
+  defp token_usage_payload(token_usage) do
+    %{
+      input_tokens: token_usage.input_tokens,
+      output_tokens: token_usage.output_tokens,
+      total_tokens: token_usage.total_tokens,
+      session_count: token_usage.session_count
+    }
   end
 
   defp issue_url_from_entry(%{issue: %{url: url}}), do: url
@@ -282,12 +349,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp ledger_payload(_ledger), do: %{}
 
-  defp ledger_entry(issue_id) when is_binary(issue_id) do
-    case SymphonyElixir.Ledger.get(issue_id) do
-      entry when is_map(entry) -> entry
-      _ -> %{}
-    end
-  end
+  defp ledger_entry(issue_id) when is_binary(issue_id), do: SymphonyElixir.Ledger.get(issue_id)
 
   defp ledger_entry(_issue_id), do: %{}
 

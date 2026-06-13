@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, Ledger, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, Ledger, StatusDashboard, TokenUsageLedger, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -18,6 +18,9 @@ defmodule SymphonyElixir.Orchestrator do
   # so it never recovers (self-perpetuating thrash). A 429/issue_state_refresh
   # failure means "stop hitting the API", so we wait minutes, not seconds.
   @rate_limit_retry_ms 300_000
+  @minimum_claim_lease_ttl_ms 60_000
+  @claim_lease_ttl_poll_multiplier 3
+  @claim_lease_marker_interval_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -31,6 +34,8 @@ defmodule SymphonyElixir.Orchestrator do
     @moduledoc """
     Runtime state for the orchestrator polling loop.
     """
+
+    @type t :: %__MODULE__{}
 
     defstruct [
       :poll_interval_ms,
@@ -48,6 +53,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      claim_leases: %{},
+      expired_claims: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -168,8 +175,13 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        state =
+          state
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+          |> refresh_claim_lease_from_running(issue_id, updated_running_entry)
+
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -183,6 +195,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        :ok = append_token_usage_observation(issue_id, updated_running_entry, update, false)
 
         Ledger.add_tokens(issue_id, token_delta)
         maybe_record_codex_ledger_event(issue_id, update)
@@ -191,7 +204,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
-          |> then(fn state -> %{state | running: Map.put(running, issue_id, updated_running_entry)} end)
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+          |> refresh_claim_lease_from_running(issue_id, updated_running_entry)
           |> enforce_issue_token_budget(issue_id, updated_running_entry)
 
         notify_dashboard()
@@ -233,7 +247,8 @@ defmodule SymphonyElixir.Orchestrator do
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
         workspace_path: Map.get(running_entry, :workspace_path),
-        previous_attempt: previous_attempt_from_running(running_entry)
+        previous_attempt: previous_attempt_from_running(running_entry),
+        worker_id: lease_worker_id(running_entry)
       })
     end
   end
@@ -298,7 +313,8 @@ defmodule SymphonyElixir.Orchestrator do
       error: "agent exited: #{inspect(reason)}",
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
-      previous_attempt: previous_attempt_from_running(running_entry)
+      previous_attempt: previous_attempt_from_running(running_entry),
+      worker_id: lease_worker_id(running_entry)
     })
   end
 
@@ -307,15 +323,16 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
-      |> drain_slot_queue()
+      |> refresh_running_claim_leases()
 
     with :ok <- Config.validate!(),
          :ok <- ensure_workspace_mirror(),
-         {:ok, issues} <- fetch_candidate_issues_for_dispatch(state),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- fetch_candidate_issues_for_dispatch(state) do
       state
+      |> recover_expired_claim_leases(issues)
       |> update_candidate_cache(issues)
-      |> choose_issues_from_cache()
+      |> drain_slot_queue()
+      |> dispatch_cached_issues()
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -354,9 +371,14 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
+    end
+  end
 
-      false ->
-        state
+  defp dispatch_cached_issues(%State{} = state) do
+    if available_slots(state) > 0 do
+      choose_issues_from_cache(state)
+    else
+      state
     end
   end
 
@@ -498,6 +520,26 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec start_claim_lease_for_test(State.t(), Issue.t(), map(), integer() | nil) :: State.t()
+  def start_claim_lease_for_test(%State{} = state, %Issue{} = issue, running_entry, attempt \\ nil)
+      when is_map(running_entry) do
+    start_claim_lease(state, issue, running_entry, attempt)
+  end
+
+  @doc false
+  @spec refresh_claim_lease_from_running_for_test(State.t(), String.t(), map()) :: State.t()
+  def refresh_claim_lease_from_running_for_test(%State{} = state, issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    refresh_claim_lease_from_running(state, issue_id, running_entry)
+  end
+
+  @doc false
+  @spec recover_expired_claim_leases_for_test(State.t(), [Issue.t()]) :: State.t()
+  def recover_expired_claim_leases_for_test(%State{} = state, issues) when is_list(issues) do
+    recover_expired_claim_leases(state, issues)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -651,6 +693,401 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp refresh_running_claim_leases(%State{} = state) do
+    Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+      refresh_claim_lease_from_running(state_acc, issue_id, running_entry)
+    end)
+  end
+
+  defp start_claim_lease(%State{} = state, %Issue{} = issue, running_entry, attempt)
+       when is_map(running_entry) do
+    times = claim_lease_times()
+
+    lease =
+      state.claim_leases
+      |> Map.get(issue.id, %{})
+      |> Map.merge(%{
+        issue_id: issue.id,
+        identifier: issue.identifier || issue.id,
+        state: :active,
+        worker_id: lease_worker_id(running_entry),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        attempt: claim_attempt_number(attempt),
+        last_seen_at: times.now,
+        lease_started_at: times.now,
+        lease_expires_at: times.expires_at,
+        lease_expires_at_ms: times.expires_at_ms,
+        heartbeat_count: 1,
+        retry_due_at: nil,
+        retry_due_at_ms: nil,
+        retry_backoff_ms: nil,
+        error: nil
+      })
+
+    put_claim_lease(state, issue.id, lease, times.now_ms, force: true)
+  end
+
+  defp refresh_claim_lease_from_running(%State{} = state, issue_id, running_entry)
+       when is_binary(issue_id) and is_map(running_entry) do
+    case Map.get(state.claim_leases, issue_id) do
+      nil ->
+        state
+
+      lease ->
+        times = claim_lease_times()
+
+        refreshed_lease =
+          lease
+          |> Map.merge(%{
+            state: :active,
+            worker_id: lease_worker_id(running_entry),
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path),
+            attempt: Map.get(lease, :attempt, 1),
+            last_seen_at: times.now,
+            lease_expires_at: times.expires_at,
+            lease_expires_at_ms: times.expires_at_ms,
+            heartbeat_count: Map.get(lease, :heartbeat_count, 0) + 1,
+            retry_due_at: nil,
+            retry_due_at_ms: nil,
+            retry_backoff_ms: nil,
+            error: nil
+          })
+
+        put_claim_lease(state, issue_id, refreshed_lease, times.now_ms)
+    end
+  end
+
+  defp mark_retry_claim_lease(%State{} = state, issue_id, retry_entry) when is_binary(issue_id) do
+    case Map.get(state.claim_leases, issue_id) do
+      nil ->
+        state
+
+      lease ->
+        times = claim_lease_times()
+        retry_due_at_ms = Map.get(retry_entry, :due_at_ms)
+        retry_expires_at_ms = retry_lease_expires_at_ms(times, retry_due_at_ms)
+
+        retry_lease =
+          lease
+          |> Map.merge(%{
+            state: :retrying,
+            identifier: retry_entry_value(retry_entry, lease, :identifier, issue_id),
+            worker_id: retry_entry_value(retry_entry, lease, :worker_id),
+            worker_host: Map.get(retry_entry, :worker_host),
+            workspace_path: Map.get(retry_entry, :workspace_path),
+            attempt: retry_entry_value(retry_entry, lease, :attempt, 1),
+            lease_expires_at: DateTime.add(times.now, retry_expires_at_ms - times.now_ms, :millisecond),
+            lease_expires_at_ms: retry_expires_at_ms,
+            retry_due_at: retry_due_at(times, retry_due_at_ms),
+            retry_due_at_ms: retry_due_at_ms,
+            retry_backoff_ms: retry_backoff_ms(times, retry_due_at_ms),
+            error: Map.get(retry_entry, :error)
+          })
+
+        put_claim_lease(state, issue_id, retry_lease, times.now_ms, force: true)
+    end
+  end
+
+  defp retry_entry_value(retry_entry, lease, key, fallback \\ nil) do
+    Map.get(retry_entry, key) || Map.get(lease, key) || fallback
+  end
+
+  defp retry_lease_expires_at_ms(times, retry_due_at_ms) do
+    max(times.expires_at_ms, (retry_due_at_ms || times.now_ms) + claim_lease_ttl_ms())
+  end
+
+  defp retry_due_at(_times, nil), do: nil
+
+  defp retry_due_at(times, retry_due_at_ms) when is_integer(retry_due_at_ms) do
+    DateTime.add(times.now, retry_due_at_ms - times.now_ms, :millisecond)
+  end
+
+  defp retry_backoff_ms(_times, nil), do: nil
+
+  defp retry_backoff_ms(times, retry_due_at_ms) when is_integer(retry_due_at_ms) do
+    max(0, retry_due_at_ms - times.now_ms)
+  end
+
+  defp mark_blocked_claim_lease(%State{} = state, issue_id, blocked_entry) when is_binary(issue_id) do
+    case Map.get(state.claim_leases, issue_id) do
+      nil ->
+        state
+
+      lease ->
+        times = claim_lease_times()
+
+        blocked_lease =
+          lease
+          |> Map.merge(%{
+            state: :blocked,
+            identifier: Map.get(blocked_entry, :identifier) || Map.get(lease, :identifier) || issue_id,
+            worker_id: Map.get(lease, :worker_id),
+            worker_host: Map.get(blocked_entry, :worker_host),
+            workspace_path: Map.get(blocked_entry, :workspace_path),
+            session_id: Map.get(blocked_entry, :session_id),
+            lease_expires_at: times.expires_at,
+            lease_expires_at_ms: times.expires_at_ms,
+            error: Map.get(blocked_entry, :error)
+          })
+
+        put_claim_lease(state, issue_id, blocked_lease, times.now_ms, force: true)
+    end
+  end
+
+  defp recover_expired_claim_leases(%State{} = state, issues) when is_list(issues) do
+    now_ms = System.monotonic_time(:millisecond)
+    issues_by_id = Map.new(issues, &{&1.id, &1})
+
+    state.claim_leases
+    |> Enum.filter(fn {issue_id, lease} ->
+      claim_lease_expired?(lease, now_ms) and not live_claim?(state, issue_id)
+    end)
+    |> Enum.reduce(state, fn {issue_id, lease}, state_acc ->
+      recover_expired_claim_lease(state_acc, issue_id, lease, Map.get(issues_by_id, issue_id), now_ms)
+    end)
+  end
+
+  defp recover_expired_claim_leases(state, _issues), do: state
+
+  defp recover_expired_claim_lease(%State{} = state, issue_id, lease, %Issue{} = issue, _now_ms) do
+    if retry_candidate_issue?(issue, terminal_state_set()) do
+      expired_at = DateTime.utc_now()
+      error = "claim lease expired at #{iso8601(expired_at)}; requeueing"
+      attempt = expired_retry_attempt(state, issue_id, lease)
+
+      Logger.warning("Claim lease expired; requeueing issue_id=#{issue_id} issue_identifier=#{issue.identifier} attempt=#{attempt}")
+
+      state
+      |> put_expired_claim(issue_id, lease, expired_at, error)
+      |> schedule_issue_retry(issue_id, attempt, %{
+        identifier: issue.identifier,
+        error: error,
+        worker_host: Map.get(lease, :worker_host),
+        workspace_path: Map.get(lease, :workspace_path),
+        worker_id: Map.get(lease, :worker_id),
+        delay_ms: 0
+      })
+    else
+      Logger.warning("Claim lease expired for non-candidate issue_id=#{issue_id}; releasing claim")
+      release_issue_claim(state, issue_id)
+    end
+  end
+
+  defp recover_expired_claim_lease(%State{} = state, issue_id, _lease, _issue, _now_ms) do
+    Logger.warning("Claim lease expired for invisible issue_id=#{issue_id}; releasing claim")
+    release_issue_claim(state, issue_id)
+  end
+
+  defp put_expired_claim(%State{} = state, issue_id, lease, expired_at, error) do
+    expired_claim =
+      lease
+      |> Map.merge(%{
+        state: :expired,
+        expired_at: expired_at,
+        requeued_at: DateTime.utc_now(),
+        error: error
+      })
+
+    %{state | expired_claims: Map.put(state.expired_claims, issue_id, expired_claim)}
+  end
+
+  defp put_claim_lease(%State{} = state, issue_id, lease, now_ms, opts \\ []) do
+    previous = Map.get(state.claim_leases, issue_id)
+    lease = maybe_publish_claim_lease_marker(issue_id, previous, lease, now_ms, opts)
+
+    %{state | claim_leases: Map.put(state.claim_leases, issue_id, lease)}
+  end
+
+  defp maybe_publish_claim_lease_marker(issue_id, previous, lease, now_ms, opts) do
+    if claim_lease_marker_due?(previous, lease, now_ms, opts) do
+      body = claim_lease_marker_body(lease)
+
+      case safe_create_tracker_comment(issue_id, body) do
+        :ok -> Map.put(lease, :last_marker_at_ms, now_ms)
+        {:error, _reason} -> inherit_last_marker_at(lease, previous)
+      end
+    else
+      inherit_last_marker_at(lease, previous)
+    end
+  end
+
+  defp claim_lease_marker_due?(nil, _lease, _now_ms, _opts), do: true
+
+  defp claim_lease_marker_due?(previous, lease, now_ms, opts) do
+    Keyword.get(opts, :force, false) or
+      claim_lease_material_change?(previous, lease) or
+      claim_lease_marker_interval_due?(previous, now_ms)
+  end
+
+  defp claim_lease_material_change?(previous, lease) do
+    fields = [:state, :worker_id, :worker_host, :workspace_path, :attempt, :retry_due_at_ms, :error]
+
+    Enum.any?(fields, fn field ->
+      Map.get(previous, field) != Map.get(lease, field)
+    end)
+  end
+
+  defp claim_lease_marker_interval_due?(previous, now_ms) do
+    case Map.get(previous, :last_marker_at_ms) do
+      marker_at_ms when is_integer(marker_at_ms) -> now_ms - marker_at_ms >= @claim_lease_marker_interval_ms
+      _ -> true
+    end
+  end
+
+  defp inherit_last_marker_at(lease, nil), do: lease
+
+  defp inherit_last_marker_at(lease, previous) do
+    Map.put(lease, :last_marker_at_ms, Map.get(previous, :last_marker_at_ms))
+  end
+
+  defp safe_create_tracker_comment(issue_id, body) do
+    Tracker.create_comment(issue_id, body)
+  rescue
+    error ->
+      Logger.warning("Failed to write claim lease marker for issue_id=#{issue_id}: #{Exception.message(error)}")
+      {:error, error}
+  catch
+    kind, reason ->
+      Logger.warning("Failed to write claim lease marker for issue_id=#{issue_id}: #{inspect({kind, reason})}")
+      {:error, reason}
+  end
+
+  defp claim_lease_marker_body(lease) do
+    ["## Symphony Claim Lease", "" | claim_lease_marker_lines(lease)]
+    |> Enum.join("\n")
+  end
+
+  defp claim_lease_marker_lines(lease) do
+    [
+      {:state, Map.get(lease, :state), "n/a"},
+      {:worker_id, Map.get(lease, :worker_id), "n/a"},
+      {:worker_host, Map.get(lease, :worker_host), "local"},
+      {:workspace_path, Map.get(lease, :workspace_path), "pending"},
+      {:attempt, Map.get(lease, :attempt), 1},
+      {:last_seen_at, iso8601(Map.get(lease, :last_seen_at)), "n/a"},
+      {:lease_expires_at, iso8601(Map.get(lease, :lease_expires_at)), "n/a"},
+      {:retry_due_at, iso8601(Map.get(lease, :retry_due_at)), "n/a"},
+      {:retry_backoff_ms, Map.get(lease, :retry_backoff_ms), "n/a"},
+      {:error, Map.get(lease, :error), "n/a"}
+    ]
+    |> Enum.map(fn {key, value, fallback} -> "- #{key}: #{value || fallback}" end)
+  end
+
+  defp claim_lease_expired?(lease, now_ms) when is_map(lease) and is_integer(now_ms) do
+    case Map.get(lease, :lease_expires_at_ms) do
+      expires_at_ms when is_integer(expires_at_ms) -> expires_at_ms <= now_ms
+      _ -> false
+    end
+  end
+
+  defp live_claim?(%State{} = state, issue_id) do
+    Map.has_key?(state.running, issue_id) or Map.has_key?(state.blocked, issue_id)
+  end
+
+  defp expired_retry_attempt(%State{} = state, issue_id, lease) do
+    lease_attempt = Map.get(lease, :attempt, 1)
+    retry_attempt = state.retry_attempts |> Map.get(issue_id, %{}) |> Map.get(:attempt, 0)
+
+    max(lease_attempt, retry_attempt) + 1
+  end
+
+  defp claim_lease_times do
+    now = DateTime.utc_now()
+    now_ms = System.monotonic_time(:millisecond)
+    ttl_ms = claim_lease_ttl_ms()
+
+    %{
+      now: now,
+      now_ms: now_ms,
+      expires_at: DateTime.add(now, ttl_ms, :millisecond),
+      expires_at_ms: now_ms + ttl_ms
+    }
+  end
+
+  defp claim_lease_ttl_ms do
+    Config.settings!().polling.interval_ms
+    |> Kernel.*(@claim_lease_ttl_poll_multiplier)
+    |> max(@minimum_claim_lease_ttl_ms)
+  end
+
+  defp claim_attempt_number(attempt) when is_integer(attempt) and attempt > 0, do: attempt
+  defp claim_attempt_number(_attempt), do: 1
+
+  defp lease_worker_id(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :worker_id) do
+      worker_id when is_binary(worker_id) and worker_id != "" ->
+        worker_id
+
+      _ ->
+        host = Map.get(running_entry, :worker_host) || "local"
+        pid = Map.get(running_entry, :pid)
+        "#{host}:#{if(is_pid(pid), do: inspect(pid), else: "unknown")}"
+    end
+  end
+
+  defp restore_claim_lease(state, _issue_id, nil), do: state
+
+  defp restore_claim_lease(%State{} = state, issue_id, lease) when is_binary(issue_id) and is_map(lease) do
+    %{state | claim_leases: Map.put(state.claim_leases, issue_id, lease)}
+  end
+
+  defp claim_lease_snapshot_entry(lease, now_ms) do
+    %{
+      issue_id: Map.get(lease, :issue_id),
+      identifier: Map.get(lease, :identifier),
+      state: lease_state_string(Map.get(lease, :state)),
+      worker_id: Map.get(lease, :worker_id),
+      worker_host: Map.get(lease, :worker_host),
+      workspace_path: Map.get(lease, :workspace_path),
+      attempt: Map.get(lease, :attempt),
+      last_seen_at: Map.get(lease, :last_seen_at),
+      lease_expires_at: Map.get(lease, :lease_expires_at),
+      lease_expires_in_ms: lease_expires_in_ms(lease, now_ms),
+      retry_due_at: Map.get(lease, :retry_due_at),
+      retry_due_in_ms: retry_due_in_ms(lease, now_ms),
+      retry_backoff_ms: Map.get(lease, :retry_backoff_ms),
+      error: Map.get(lease, :error)
+    }
+  end
+
+  defp expired_claim_snapshot_entry(lease, now_ms) do
+    lease
+    |> claim_lease_snapshot_entry(now_ms)
+    |> Map.merge(%{
+      state: "expired",
+      expired_at: Map.get(lease, :expired_at),
+      requeued_at: Map.get(lease, :requeued_at)
+    })
+  end
+
+  defp lease_expires_in_ms(lease, now_ms) do
+    case Map.get(lease, :lease_expires_at_ms) do
+      expires_at_ms when is_integer(expires_at_ms) -> expires_at_ms - now_ms
+      _ -> nil
+    end
+  end
+
+  defp retry_due_in_ms(lease, now_ms) do
+    case Map.get(lease, :retry_due_at_ms) do
+      due_at_ms when is_integer(due_at_ms) -> max(0, due_at_ms - now_ms)
+      _ -> nil
+    end
+  end
+
+  defp lease_state_string(state) when is_atom(state), do: Atom.to_string(state)
+  defp lease_state_string(state) when is_binary(state), do: state
+  defp lease_state_string(_state), do: nil
+
+  defp iso8601(%DateTime{} = datetime) do
+    datetime
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp iso8601(_datetime), do: nil
+
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
       nil ->
@@ -671,7 +1108,9 @@ defmodule SymphonyElixir.Orchestrator do
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            claim_leases: Map.delete(state.claim_leases, issue_id),
+            expired_claims: Map.delete(state.expired_claims, issue_id)
         }
 
       _ ->
@@ -727,14 +1166,19 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
 
         next_attempt = next_retry_attempt_from_running(running_entry)
+        previous_lease = Map.get(state.claim_leases, issue_id)
 
         state
         |> terminate_running_issue(issue_id, false)
+        |> restore_claim_lease(issue_id, previous_lease)
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
           error: "stalled for #{elapsed_ms}ms without codex activity",
-          previous_attempt: previous_attempt_from_running(running_entry)
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
+          previous_attempt: previous_attempt_from_running(running_entry),
+          worker_id: lease_worker_id(running_entry)
         })
       end
     else
@@ -873,13 +1317,15 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
     }
 
-    %{
+    state = %{
       state
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
+
+    mark_blocked_claim_lease(state, issue_id, blocked_entry)
   end
 
   defp block_issue_without_running(%State{} = state, %Issue{} = issue, reason) do
@@ -1226,38 +1672,42 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
         ledger_entry = record_dispatch_in_ledger(issue, worker_host)
 
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            ledger_entry: ledger_entry,
-            previous_attempt: previous_attempt,
-            started_at: DateTime.utc_now()
-          })
+        running_entry = %{
+          pid: pid,
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: worker_host,
+          workspace_path: nil,
+          session_id: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0,
+          retry_attempt: normalize_retry_attempt(attempt),
+          ledger_entry: ledger_entry,
+          previous_attempt: previous_attempt,
+          started_at: DateTime.utc_now()
+        }
 
-        %{
+        running = Map.put(state.running, issue.id, running_entry)
+
+        state = %{
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            expired_claims: Map.delete(state.expired_claims, issue.id)
         }
+
+        start_claim_lease(state, issue, running_entry, attempt)
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1314,6 +1764,7 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
     previous_attempt = pick_retry_previous_attempt(previous_retry, metadata)
+    worker_id = pick_retry_worker_id(previous_retry, metadata)
 
     Ledger.put(issue_id, %{
       retries: next_attempt,
@@ -1330,22 +1781,27 @@ defmodule SymphonyElixir.Orchestrator do
 
     Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
 
-    %{
-      state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            issue_url: issue_url,
-            error: error,
-            worker_host: worker_host,
-            workspace_path: workspace_path,
-            previous_attempt: previous_attempt
-          })
+    retry_entry = %{
+      attempt: next_attempt,
+      timer_ref: timer_ref,
+      retry_token: retry_token,
+      due_at_ms: due_at_ms,
+      identifier: identifier,
+      issue_url: issue_url,
+      error: error,
+      worker_host: worker_host,
+      workspace_path: workspace_path,
+      previous_attempt: previous_attempt,
+      worker_id: worker_id
     }
+
+    state = %{
+      state
+      | claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.put(state.retry_attempts, issue_id, retry_entry)
+    }
+
+    mark_retry_claim_lease(state, issue_id, retry_entry)
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -1357,7 +1813,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
-          previous_attempt: Map.get(retry_entry, :previous_attempt)
+          previous_attempt: Map.get(retry_entry, :previous_attempt),
+          worker_id: Map.get(retry_entry, :worker_id)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1542,12 +1999,17 @@ defmodule SymphonyElixir.Orchestrator do
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
-        slot_queue: reject_slot_queue_issue(state.slot_queue, issue_id)
+        slot_queue: reject_slot_queue_issue(state.slot_queue, issue_id),
+        claim_leases: Map.delete(state.claim_leases, issue_id),
+        expired_claims: Map.delete(state.expired_claims, issue_id)
     }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     cond do
+      is_integer(metadata[:delay_ms]) and metadata[:delay_ms] >= 0 ->
+        metadata[:delay_ms]
+
       rate_limited_error?(metadata[:error]) ->
         max(rate_limit_retry_delay(metadata[:error]), failure_retry_delay(attempt))
 
@@ -1698,6 +2160,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_previous_attempt(previous_retry, metadata) do
     metadata[:previous_attempt] || Map.get(previous_retry, :previous_attempt)
+  end
+
+  defp pick_retry_worker_id(previous_retry, metadata) do
+    metadata[:worker_id] || Map.get(previous_retry, :worker_id)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
@@ -1897,11 +2363,21 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    claim_leases =
+      state.claim_leases
+      |> Enum.map(fn {_issue_id, lease} -> claim_lease_snapshot_entry(lease, now_ms) end)
+
+    expired =
+      state.expired_claims
+      |> Enum.map(fn {_issue_id, lease} -> expired_claim_snapshot_entry(lease, now_ms) end)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        blocked: blocked,
+       claim_leases: claim_leases,
+       expired: expired,
        codex_totals: state.codex_totals,
        ledger: Ledger.all(),
        rate_limits: Map.get(state, :codex_rate_limits),
@@ -2046,6 +2522,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
+    :ok = append_token_usage_observation(running_entry_issue_id(running_entry), running_entry, nil, true)
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
     maybe_record_previous_attempt(running_entry)
 
@@ -2078,6 +2555,51 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_record_previous_attempt(_running_entry), do: :ok
+
+  defp append_token_usage_observation(issue_id, running_entry, update, final?) when is_map(running_entry) do
+    if token_usage_observation?(running_entry) do
+      TokenUsageLedger.append_observation(%{
+        observed_at: DateTime.utc_now(),
+        final: final?,
+        issue_id: issue_id,
+        issue_identifier: Map.get(running_entry, :identifier),
+        session_id: Map.get(running_entry, :session_id),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        turn_count: Map.get(running_entry, :turn_count, 0),
+        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+        source_event: token_usage_source_event(update, final?)
+      })
+    end
+
+    :ok
+  end
+
+  defp token_usage_observation?(running_entry) do
+    is_binary(Map.get(running_entry, :session_id)) and
+      Enum.any?(
+        [
+          Map.get(running_entry, :codex_input_tokens, 0),
+          Map.get(running_entry, :codex_output_tokens, 0),
+          Map.get(running_entry, :codex_total_tokens, 0)
+        ],
+        &(&1 > 0)
+      )
+  end
+
+  defp token_usage_source_event(_update, true), do: :session_final
+
+  defp token_usage_source_event(%{event: event}, _final?), do: event
+
+  defp token_usage_source_event(_update, _final?), do: nil
+
+  defp running_entry_issue_id(%{issue: %Issue{id: issue_id}}) when is_binary(issue_id), do: issue_id
+
+  defp running_entry_issue_id(%{issue_id: issue_id}) when is_binary(issue_id), do: issue_id
+
+  defp running_entry_issue_id(_running_entry), do: nil
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()

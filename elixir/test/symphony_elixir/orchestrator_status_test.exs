@@ -191,6 +191,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.turn_count == 1
     assert is_integer(snapshot_entry.runtime_seconds)
 
+    ledger_file = Application.fetch_env!(:symphony_elixir, :token_usage_ledger_file)
+
+    assert [
+             %{
+               final: false,
+               issue_id: ^issue_id,
+               issue_identifier: "MT-201",
+               session_id: "thread-usage-turn-usage",
+               input_tokens: 12,
+               output_tokens: 4,
+               total_tokens: 16,
+               source_event: "notification"
+             }
+           ] = SymphonyElixir.TokenUsageLedger.read_records(file: ledger_file)
+
     send(pid, {:DOWN, process_ref, :process, self(), :normal})
     completed_state = :sys.get_state(pid)
 
@@ -198,6 +213,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert completed_state.codex_totals.output_tokens == 4
     assert completed_state.codex_totals.total_tokens == 16
     assert is_integer(completed_state.codex_totals.seconds_running)
+
+    assert [
+             %{final: false},
+             %{
+               final: true,
+               issue_id: ^issue_id,
+               issue_identifier: "MT-201",
+               session_id: "thread-usage-turn-usage",
+               input_tokens: 12,
+               output_tokens: 4,
+               total_tokens: 16,
+               source_event: "session_final"
+             }
+           ] = SymphonyElixir.TokenUsageLedger.read_records(file: ledger_file)
   end
 
   test "token budget counts only uncached spend, excluding cached prefix reads" do
@@ -811,6 +840,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "thread-usage-turn-usage",
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
     for usage <- [
           %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11},
           %{"input_tokens" => 10, "output_tokens" => 4, "total_tokens" => 14}
@@ -834,6 +873,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_input_tokens == 10
     assert snapshot_entry.codex_output_tokens == 4
     assert snapshot_entry.codex_total_tokens == 14
+
+    ledger_file = Application.fetch_env!(:symphony_elixir, :token_usage_ledger_file)
+
+    assert SymphonyElixir.TokenUsageLedger.summary(file: ledger_file) == %{
+             input_tokens: 10,
+             output_tokens: 4,
+             total_tokens: 14,
+             issue_count: 1,
+             session_count: 1
+           }
   end
 
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
@@ -1145,6 +1194,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
       last_codex_event: :notification,
+      codex_input_tokens: 20,
+      codex_output_tokens: 3,
+      codex_total_tokens: 23,
       started_at: stale_activity_at
     }
 
@@ -1171,8 +1223,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms >= 8_000
     assert remaining_ms <= 10_500
+
+    ledger_file = Application.fetch_env!(:symphony_elixir, :token_usage_ledger_file)
+
+    assert [
+             %{
+               final: true,
+               issue_id: ^issue_id,
+               issue_identifier: "MT-STALL",
+               session_id: "thread-stall-turn-stall",
+               total_tokens: 23,
+               source_event: "session_final"
+             }
+           ] = SymphonyElixir.TokenUsageLedger.read_records(file: ledger_file)
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
@@ -1359,6 +1424,201 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              identifier: "MT-INPUT-NORMAL",
              error: "codex turn requires operator input"
            } = state.blocked[issue_id]
+  end
+
+  test "claim lease marker is persisted when an issue is claimed" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{
+      id: "issue-lease",
+      identifier: "MT-LEASE",
+      title: "Lease marker",
+      state: "In Progress"
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: "/tmp/symphony_workspaces/MT-LEASE",
+      started_at: DateTime.utc_now()
+    }
+
+    state =
+      %Orchestrator.State{poll_interval_ms: 30_000, max_concurrent_agents: 1}
+      |> Orchestrator.start_claim_lease_for_test(issue, running_entry)
+
+    assert %{
+             state: :active,
+             worker_id: "local:" <> _,
+             workspace_path: "/tmp/symphony_workspaces/MT-LEASE",
+             attempt: 1,
+             lease_expires_at: %DateTime{}
+           } = state.claim_leases[issue.id]
+
+    assert_receive {:memory_tracker_comment, "issue-lease", body}
+    assert body =~ "## Symphony Claim Lease"
+    assert body =~ "- state: active"
+    assert body =~ "- worker_id: local:"
+    assert body =~ "- workspace_path: /tmp/symphony_workspaces/MT-LEASE"
+    assert body =~ "- attempt: 1"
+    assert body =~ "- lease_expires_at:"
+  end
+
+  test "claim lease heartbeat refresh updates last seen and lease expiry" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{id: "issue-heartbeat", identifier: "MT-HB", title: "Heartbeat", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: "worker-a",
+      workspace_path: "/workspaces/MT-HB",
+      started_at: DateTime.utc_now()
+    }
+
+    state =
+      %Orchestrator.State{poll_interval_ms: 30_000, max_concurrent_agents: 1}
+      |> Orchestrator.start_claim_lease_for_test(issue, running_entry)
+
+    assert_receive {:memory_tracker_comment, "issue-heartbeat", _body}
+
+    stale_seen_at = DateTime.add(DateTime.utc_now(), -120, :second)
+    stale_marker_at_ms = System.monotonic_time(:millisecond) - 90_000
+    stale_expires_at_ms = System.monotonic_time(:millisecond) + 1_000
+    old_lease = state.claim_leases[issue.id]
+
+    state =
+      put_in(state.claim_leases[issue.id], %{
+        old_lease
+        | last_seen_at: stale_seen_at,
+          lease_expires_at_ms: stale_expires_at_ms,
+          last_marker_at_ms: stale_marker_at_ms
+      })
+
+    refreshed_state = Orchestrator.refresh_claim_lease_from_running_for_test(state, issue.id, running_entry)
+    refreshed_lease = refreshed_state.claim_leases[issue.id]
+
+    assert DateTime.compare(refreshed_lease.last_seen_at, stale_seen_at) == :gt
+    assert refreshed_lease.lease_expires_at_ms > stale_expires_at_ms
+    assert refreshed_lease.heartbeat_count == old_lease.heartbeat_count + 1
+
+    assert_receive {:memory_tracker_comment, "issue-heartbeat", body}
+    assert body =~ "- state: active"
+    assert body =~ "- worker_host: worker-a"
+  end
+
+  test "expired claim leases are requeued and logged" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{
+      id: "issue-expired-lease",
+      identifier: "MT-EXPIRED-LEASE",
+      title: "Expired lease",
+      state: "In Progress"
+    }
+
+    expired_lease = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      state: :active,
+      worker_id: "local:#PID<0.1.0>",
+      worker_host: nil,
+      workspace_path: "/tmp/symphony_workspaces/MT-EXPIRED-LEASE",
+      attempt: 1,
+      last_seen_at: DateTime.add(DateTime.utc_now(), -120, :second),
+      lease_expires_at: DateTime.add(DateTime.utc_now(), -1, :second),
+      lease_expires_at_ms: System.monotonic_time(:millisecond) - 1,
+      last_marker_at_ms: System.monotonic_time(:millisecond) - 120_000
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      claimed: MapSet.new([issue.id]),
+      claim_leases: %{issue.id => expired_lease}
+    }
+
+    log =
+      capture_log(fn ->
+        recovered_state = Orchestrator.recover_expired_claim_leases_for_test(state, [issue])
+        send(self(), {:recovered_state, recovered_state})
+      end)
+
+    assert_receive {:recovered_state, recovered_state}
+    assert log =~ "Claim lease expired; requeueing"
+
+    assert %{attempt: 2, error: "claim lease expired" <> _} = recovered_state.retry_attempts[issue.id]
+    assert %{state: :expired, error: "claim lease expired" <> _} = recovered_state.expired_claims[issue.id]
+    assert %{state: :retrying, attempt: 2, retry_backoff_ms: 0} = recovered_state.claim_leases[issue.id]
+    assert MapSet.member?(recovered_state.claimed, issue.id)
+
+    assert_receive {:memory_tracker_comment, "issue-expired-lease", body}
+    assert body =~ "- state: retrying"
+    assert body =~ "- retry_backoff_ms: 0"
+  end
+
+  test "expired claim lease recovery does not duplicate live workers" do
+    issue = %Issue{
+      id: "issue-live-expired",
+      identifier: "MT-LIVE-EXPIRED",
+      title: "Live expired lease",
+      state: "In Progress"
+    }
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :normal)
+    end)
+
+    expired_lease = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      state: :active,
+      worker_id: "local:#PID<0.2.0>",
+      worker_host: nil,
+      workspace_path: "/tmp/symphony_workspaces/MT-LIVE-EXPIRED",
+      attempt: 1,
+      last_seen_at: DateTime.add(DateTime.utc_now(), -120, :second),
+      lease_expires_at: DateTime.add(DateTime.utc_now(), -1, :second),
+      lease_expires_at_ms: System.monotonic_time(:millisecond) - 1
+    }
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      claimed: MapSet.new([issue.id]),
+      running: %{
+        issue.id => %{
+          pid: worker_pid,
+          ref: make_ref(),
+          identifier: issue.identifier,
+          issue: issue,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claim_leases: %{issue.id => expired_lease}
+    }
+
+    recovered_state = Orchestrator.recover_expired_claim_leases_for_test(state, [issue])
+
+    assert recovered_state.retry_attempts == %{}
+    assert recovered_state.expired_claims == %{}
+    assert recovered_state.running[issue.id].pid == worker_pid
   end
 
   test "status dashboard renders offline marker to terminal" do
