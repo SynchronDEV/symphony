@@ -1397,7 +1397,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_cap_status(%Issue{id: issue_id} = issue) when is_binary(issue_id) do
     settings = Config.settings!().agent
-    ledger_entry = Ledger.get(issue_id)
+
+    ledger_entry =
+      issue
+      |> reconcile_rework_count_for_dispatch(settings.max_rework_cycles)
+      |> Ledger.get()
 
     cond do
       is_binary(Map.get(ledger_entry, :blocked_reason)) ->
@@ -1415,6 +1419,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_cap_status(_issue), do: :ok
+
+  defp reconcile_rework_count_for_dispatch(%Issue{id: issue_id} = issue, max_rework_cycles)
+       when is_binary(issue_id) and is_integer(max_rework_cycles) do
+    if rework_dispatch?(issue) do
+      case Tracker.fetch_issue_rework_count(issue_id) do
+        {:ok, count} ->
+          Ledger.put_rework_count_at_least(issue_id, count, issue.state)
+
+        {:error, reason} ->
+          Logger.warning("Unable to reconcile Linear rework history for #{issue_context(issue)}: #{inspect(reason)}")
+      end
+    end
+
+    issue_id
+  end
+
+  defp reconcile_rework_count_for_dispatch(%Issue{id: issue_id}, _max_rework_cycles) when is_binary(issue_id) do
+    issue_id
+  end
 
   defp cap_reached?(_count, nil), do: false
   defp cap_reached?(count, cap) when is_integer(count) and is_integer(cap), do: count >= cap

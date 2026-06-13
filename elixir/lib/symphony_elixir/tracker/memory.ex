@@ -46,6 +46,18 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_issue_rework_count(String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def fetch_issue_rework_count(issue_id) when is_binary(issue_id) do
+    counts = Application.get_env(:symphony_elixir, :memory_tracker_rework_counts, %{})
+    count = Map.get(counts, issue_id, 0)
+
+    if is_integer(count) and count >= 0 do
+      {:ok, count}
+    else
+      {:error, {:invalid_memory_rework_count, issue_id, count}}
+    end
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})

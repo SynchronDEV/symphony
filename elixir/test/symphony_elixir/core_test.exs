@@ -229,6 +229,22 @@ defmodule SymphonyElixir.CoreTest do
     assert SymphonyElixir.Ledger.get(issue_id).rework_count == 2
   end
 
+  test "ledger monotonic rework reconciliation never lowers persisted count" do
+    issue_id = "issue-rework-history-#{System.unique_integer([:positive])}"
+
+    SymphonyElixir.Ledger.put(issue_id, %{rework_count: 4})
+    SymphonyElixir.Ledger.put_rework_count_at_least(issue_id, 3)
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 4
+    refute Map.has_key?(SymphonyElixir.Ledger.get(issue_id), :last_rework_state)
+
+    SymphonyElixir.Ledger.put_rework_count_at_least(issue_id, 6)
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 6
+
+    SymphonyElixir.Ledger.put_rework_count_at_least(issue_id, 7, "Rework")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 7
+    assert SymphonyElixir.Ledger.get(issue_id).last_rework_state
+  end
+
   test "ledger migrates a legacy cwd-located file to the deployment path once" do
     # Regression (SYNC-767): the default ledger path used File.cwd!() — the
     # escript wrapper cd's to the install dir, so deployments silently shared

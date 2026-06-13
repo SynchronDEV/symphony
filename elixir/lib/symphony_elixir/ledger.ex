@@ -58,6 +58,9 @@ defmodule SymphonyElixir.Ledger do
   defp increment_value(value, amount) when is_integer(value), do: value + amount
   defp increment_value(_value, amount), do: amount
 
+  defp integer_or_zero(value) when is_integer(value), do: value
+  defp integer_or_zero(_value), do: 0
+
   @spec add_tokens(issue_id(), map()) :: issue_entry()
   def add_tokens(issue_id, token_delta) when is_binary(issue_id) and is_map(token_delta) do
     total = Map.get(token_delta, :total_tokens, 0)
@@ -73,6 +76,30 @@ defmodule SymphonyElixir.Ledger do
   def put(issue_id, attrs) when is_binary(issue_id) and is_map(attrs) do
     update(issue_id, &Map.merge(&1, attrs))
   end
+
+  @spec put_rework_count_at_least(issue_id(), non_neg_integer()) :: issue_entry()
+  def put_rework_count_at_least(issue_id, count)
+      when is_binary(issue_id) and is_integer(count) and count >= 0 do
+    put_rework_count_at_least(issue_id, count, nil)
+  end
+
+  @spec put_rework_count_at_least(issue_id(), non_neg_integer(), String.t() | nil) :: issue_entry()
+  def put_rework_count_at_least(issue_id, count, observed_state)
+      when is_binary(issue_id) and is_integer(count) and count >= 0 do
+    update(issue_id, fn entry ->
+      current_count = entry |> Map.get(:rework_count, 0) |> integer_or_zero()
+
+      entry
+      |> Map.put(:rework_count, max(current_count, count))
+      |> maybe_put_rework_observed_state(observed_state)
+    end)
+  end
+
+  defp maybe_put_rework_observed_state(entry, observed_state) when is_binary(observed_state) do
+    Map.put(entry, :last_rework_state, rework_state?(observed_state))
+  end
+
+  defp maybe_put_rework_observed_state(entry, _observed_state), do: entry
 
   @spec update(issue_id(), (issue_entry() -> issue_entry())) :: issue_entry()
   def update(issue_id, fun) when is_binary(issue_id) and is_function(fun, 1) do

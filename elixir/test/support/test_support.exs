@@ -45,6 +45,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_rework_counts)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
           if Process.whereis(SymphonyElixir.Ledger), do: SymphonyElixir.Ledger.reset!()
           Application.delete_env(:symphony_elixir, :token_usage_ledger_file)
