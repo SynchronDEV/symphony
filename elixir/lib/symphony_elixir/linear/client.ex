@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Linear.Client do
   alias SymphonyElixir.Linear.RateLimitBudget
 
   @issue_page_size 50
+  @issue_history_page_size 100
   @max_error_body_log_bytes 1_000
   @default_rate_limit_retries 1
   # When Linear reports RATELIMITED without usable rate-limit headers
@@ -147,6 +148,24 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @issue_history_query """
+  query SymphonyLinearIssueHistory($issueId: String!, $first: Int!, $after: String) {
+    issue(id: $issueId) {
+      history(first: $first, after: $after) {
+        nodes {
+          toState {
+            name
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+  """
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -217,6 +236,11 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @spec fetch_issue_rework_count(String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def fetch_issue_rework_count(issue_id) when is_binary(issue_id) do
+    do_fetch_issue_rework_count(issue_id, nil, 0, &graphql/2)
+  end
+
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do
@@ -274,6 +298,14 @@ defmodule SymphonyElixir.Linear.Client do
       ids ->
         do_fetch_issue_states(ids, nil, graphql_fun)
     end
+  end
+
+  @doc false
+  @spec fetch_issue_rework_count_for_test(String.t(), (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def fetch_issue_rework_count_for_test(issue_id, graphql_fun)
+      when is_binary(issue_id) and is_function(graphql_fun, 2) do
+    do_fetch_issue_rework_count(issue_id, nil, 0, graphql_fun)
   end
 
   defp do_fetch_by_states(project_slug, state_names, assignee_filter, updated_after) do
@@ -363,6 +395,27 @@ defmodule SymphonyElixir.Linear.Client do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp do_fetch_issue_rework_count(issue_id, after_cursor, acc_count, graphql_fun)
+       when is_binary(issue_id) and is_integer(acc_count) and is_function(graphql_fun, 2) do
+    with {:ok, body} <-
+           graphql_fun.(@issue_history_query, %{
+             issueId: issue_id,
+             first: @issue_history_page_size,
+             after: after_cursor
+           }),
+         {:ok, page_count, page_info} <- decode_issue_history_rework_count(body) do
+      continue_issue_rework_count(issue_id, acc_count + page_count, page_info, graphql_fun)
+    end
+  end
+
+  defp continue_issue_rework_count(issue_id, count, page_info, graphql_fun) do
+    case next_page_cursor(page_info) do
+      {:ok, next_cursor} -> do_fetch_issue_rework_count(issue_id, next_cursor, count, graphql_fun)
+      :done -> {:ok, count}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -576,6 +629,41 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
+
+  defp decode_issue_history_rework_count(%{
+         "data" => %{
+           "issue" => %{
+             "history" => %{
+               "nodes" => nodes,
+               "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
+             }
+           }
+         }
+       })
+       when is_list(nodes) do
+    count =
+      Enum.count(nodes, fn
+        %{"toState" => %{"name" => state_name}} -> rework_state_name?(state_name)
+        _ -> false
+      end)
+
+    {:ok, count, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+  end
+
+  defp decode_issue_history_rework_count(%{"errors" => errors}) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
+  defp decode_issue_history_rework_count(_unknown), do: {:error, :linear_unknown_payload}
+
+  defp rework_state_name?(state_name) when is_binary(state_name) do
+    state_name
+    |> String.trim()
+    |> String.downcase()
+    |> Kernel.==("rework")
+  end
+
+  defp rework_state_name?(_state_name), do: false
 
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do

@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_candidate_issues(DateTime.t() | nil) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
+  @callback fetch_issue_rework_count(String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback apply_label(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
@@ -31,6 +32,11 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
     adapter().fetch_issue_states_by_ids(issue_ids)
+  end
+
+  @spec fetch_issue_rework_count(String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def fetch_issue_rework_count(issue_id) do
+    adapter().fetch_issue_rework_count(issue_id)
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
