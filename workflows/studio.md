@@ -42,7 +42,7 @@ agent:
   stop_continue_labels: ['symphony-hold', 'symphony-stuck']
 codex:
   command: >-
-    "$SYMPHONY_STUDIO_CODEX_BIN" -c 'default_permissions="symphony_studio"' -c 'permissions={symphony_studio={extends=":workspace",filesystem={":workspace_roots"={".git"="write",".codex"="read",".agents"="read"}},network={enabled=true}}}' -c 'model="gpt-6-astra"' -c 'model_reasoning_effort="low"' -c "shell_environment_policy.set={BUN_INSTALL_CACHE_DIR=\"$PWD/.git/symphony-runtime/bun-cache\",TMPDIR=\"$PWD/.git/symphony-runtime/tmp\"}" app-server
+    "$SYMPHONY_STUDIO_CODEX_BIN" -c 'default_permissions="symphony_studio"' -c 'permissions={symphony_studio={extends=":workspace",filesystem={":workspace_roots"={".git"="write",".codex"="read",".agents"="read"}},network={enabled=true}}}' -c 'model="gpt-6-astra"' -c 'model_reasoning_effort="medium"' -c "shell_environment_policy.set={BUN_INSTALL_CACHE_DIR=\"$PWD/.git/symphony-runtime/bun-cache\",TMPDIR=\"$PWD/.git/symphony-runtime/tmp\"}" app-server
   permission_profile: symphony_studio
   approval_policy:
     granular:

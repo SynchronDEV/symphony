@@ -140,7 +140,8 @@ class StudioOperationsTest(unittest.TestCase):
 
     def test_exact_command_contract_rejects_competing_or_unknown_flags(self):
         schema = json.loads((Path(__file__).parent / "fixtures/codex-0.153.4-policies.json").read_text())
-        commands = [preflight.CANONICAL_COMMAND.replace(" app-server", " --model other app-server"),
+        commands = [preflight.CANONICAL_COMMAND.replace('model_reasoning_effort="medium"', 'model_reasoning_effort="low"'),
+                    preflight.CANONICAL_COMMAND.replace(" app-server", " --model other app-server"),
                     preflight.CANONICAL_COMMAND.replace(" app-server", " -c model='\"other\"' app-server"),
                     preflight.CANONICAL_COMMAND.replace(" app-server", " --profile unexpected app-server"),
                     preflight.CANONICAL_COMMAND + "; echo unexpected"]
@@ -186,6 +187,8 @@ class StudioOperationsTest(unittest.TestCase):
             self.assertIn(expected, config)
         command = config.split("  command: >-\n    ", 1)[1].split("\n", 1)[0]
         self.assertEqual(command, preflight.CANONICAL_COMMAND)
+        self.assertIn('model_reasoning_effort="medium"', command)
+        self.assertIn('model="gpt-6-astra"', command)
         self.assertIn("permission_profile: symphony_studio", config)
         self.assertNotIn("turn_sandbox_policy:", config)
         self.assertIn(preflight.ENVIRONMENT_COMMAND, config)

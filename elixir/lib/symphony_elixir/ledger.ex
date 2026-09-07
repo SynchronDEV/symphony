@@ -134,7 +134,7 @@ defmodule SymphonyElixir.Ledger do
 
     with {:ok, canonical_path} <- SymphonyElixir.PathSafety.canonicalize(ledger_path),
          :ok <- File.mkdir_p(Path.dirname(canonical_path)),
-         {:ok, lock} <- acquire_lock(canonical_path) do
+         {:ok, lock} <- acquire_lock(canonical_path, Keyword.get(opts, :lock_writer, &:file.write/2)) do
       case load(canonical_path) do
         {:ok, entries} ->
           {:ok, %{path: canonical_path, entries: entries, lock: lock, dirty: false, timer: nil, flush_interval_ms: Keyword.get(opts, :flush_interval_ms, 250), writes: 0}}
@@ -363,13 +363,15 @@ defmodule SymphonyElixir.Ledger do
     end
   end
 
-  defp acquire_lock(path) do
+  # The writer seam permits deterministic disk-failure checks after exclusive open.
+  # Normal startup and migration both use the filesystem writer.
+  defp acquire_lock(path, writer \\ &:file.write/2) do
     lock_path = path <> ".lock"
     owner = "#{System.pid()}:#{System.unique_integer([:positive])}"
 
     case File.open(lock_path, [:write, :exclusive]) do
       {:ok, file} ->
-        case :file.write(file, owner) do
+        case writer.(file, owner) do
           :ok ->
             File.close(file)
             {:ok, {lock_path, owner}}

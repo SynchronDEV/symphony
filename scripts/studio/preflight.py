@@ -20,7 +20,7 @@ import urllib.request
 PERMISSION_PROFILE = "symphony_studio"
 PERMISSION_CONFIG = 'permissions={symphony_studio={extends=":workspace",filesystem={":workspace_roots"={".git"="write",".codex"="read",".agents"="read"}},network={enabled=true}}}'
 COMMAND_CONFIG = ['default_permissions="symphony_studio"', PERMISSION_CONFIG,
-                  'model="gpt-6-astra"', 'model_reasoning_effort="low"']
+                  'model="gpt-6-astra"', 'model_reasoning_effort="medium"']
 ENVIRONMENT_COMMAND = r'-c "shell_environment_policy.set={BUN_INSTALL_CACHE_DIR=\"$PWD/.git/symphony-runtime/bun-cache\",TMPDIR=\"$PWD/.git/symphony-runtime/tmp\"}"'
 CANONICAL_COMMAND = '"$SYMPHONY_STUDIO_CODEX_BIN" ' + " ".join("-c " + shlex.quote(value) for value in COMMAND_CONFIG) + " " + ENVIRONMENT_COMMAND + " app-server"
 
@@ -327,7 +327,7 @@ def check(runtime, *, full=False, start=False):
         require(len(candidates) == 1 and not candidates[0]["blocked"], "Pilot start requires exactly one opted-in, unblocked issue")
     result = {"result": "ready", "runtime": str(runtime), "source_repo": str(repo), "workflow": str(workflow),
               "workspace_root": report["workspace_root"], "ledger_path": report["ledger_path"], "base_branch": "staging",
-              "codex": version, "model": "gpt-6-astra", "reasoning_effort": "low", "permission_profile": PERMISSION_PROFILE, "limits": expected, "candidates": candidates,
+              "codex": version, "model": "gpt-6-astra", "reasoning_effort": "medium", "permission_profile": PERMISSION_PROFILE, "limits": expected, "candidates": candidates,
               "source_branch": source_branch, "source_dirty_entries": dirty_entries, "remote_staging_sha": staging_sha,
               "github_default_branch": github["default_branch"], "agents_started": False}
     return result, manifest, env

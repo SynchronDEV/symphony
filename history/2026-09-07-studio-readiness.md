@@ -6,13 +6,14 @@ The implementation also incorporates fork `origin/main` at `d261a33`.
 Tracking: [SPK-1020](https://linear.app/ante-digital/issue/SPK-1020).
 Draft implementation: [Symphony PR #5](https://github.com/SynchronDEV/symphony/pull/5).
 Studio operator fix: [Studio PR #951](https://github.com/spektra-org/spektra/pull/951),
-commit `1713fe7855f040993f02fabdbe2a592554671d3a`, targeting `staging`.
+latest reviewed commit `59b1578570df31fde067cd0cb539342a053af4cc`, targeting `staging`.
 
-The code and isolated runtime are implemented and independently reviewed. Studio
-is stopped with no eligible issues. This establishes readiness for another
-supervised run; a complete unattended implementation-to-review cycle has not been
-demonstrated. The existing coverage gate remains red. Both PRs await human review
-and merge.
+The code and isolated runtime are implemented and independently reviewed. The
+full coverage gate now passes at 100.00%, without changing its threshold or
+exclusions. Ticket workers use GPT-6 Astra with medium reasoning. Studio is stopped
+with no eligible issues. A complete unattended implementation-to-review cycle has
+not been demonstrated. The operator authorized merging both linked PRs after
+their checks pass; their live GitHub pages carry the final merge status.
 
 Work was performed in an isolated checkout. Existing Studio and Symphony working
 changes were preserved. Astra agents at low reasoning effort implemented bounded
@@ -37,43 +38,52 @@ areas; separate cross-reviews and parent-run tests checked their results.
 | Legacy sandbox blocks Git branch creation | Opt-in named profile permits assigned-workspace Git writes; retain protected agent configuration paths; omit conflicting legacy overrides | Real sandbox probe, profile mismatch rejection, initial and continuation wire tests |
 | Codex filters inherited Bun cache settings and dependency installation fails | Set per-tool temporary/cache paths explicitly under the assigned workspace's `.git/symphony-runtime/` | Actual Studio frozen install and postinstall passed; every preflight exercises bare Bun with the same configured environment |
 | Usage telemetry appends identical counters on unrelated notifications | Compare prior serialized observation; retain changes and lifecycle/final evidence | End-to-end notification regression and real-log replay: 95% fewer records, identical totals |
+| Operator preflight mistakes a workflow name for a check context | Query the latest actual Build and Analyze run on the exact PR head; recheck before merge and pin the head SHA | 36 operator tests, independent rerun, full Studio gate and read-only live workflow proof |
 
 The exact remote baseline passes 277 tests with two live tests skipped, but its
-coverage gate fails at 91.30% against the existing 100% requirement. The threshold
-has not been reduced. This baseline finding is separate from functional regressions.
+coverage gate fails at 91.30% against the existing 100% requirement. The initial
+implementation was 91.19%. Added boundary/error-path tests close all 84 originally
+missed lines plus configuration branches. The threshold and exclusions have not
+changed. A narrow lock-writer dependency seam allows deterministic disk-full
+cleanup testing; an unreachable optional-path fallback after Ecto string casting
+was removed and invalid input rejection remains tested.
 
 ## Final local validation
 
-- Full functional suite: **362 tests, zero failures, two skipped live integration tests**,
-  seed `309148`, 32.1 seconds. Command: `LINEAR_API_KEY= mise exec -- mix test --seed 309148`.
-  The final `LINEAR_API_KEY= mise exec -- make all` repeated all 362 tests with zero
-  failures in 27.4 seconds while measuring coverage.
-- Build, formatting, public specs and Credo: passed through `mise exec -- make all`.
-- Dialyzer: passed with zero errors (`mise exec -- mix dialyzer --format short`).
-- Coverage: 91.19%; the unchanged 100% gate remains red. Exact remote baseline is
-  91.30%; this branch therefore remains 0.11 percentage points below that baseline.
-  `make all` therefore does not have an overall green result.
+- Full gate: **389 tests, zero failures, two skipped live integration tests**.
+  `TMPDIR=/tmp LINEAR_API_KEY='' mise exec -- make all` exited zero, including
+  build, formatting, public specs, Credo, coverage and Dialyzer.
+- Coverage: **100.00%**, unchanged threshold and exclusions. Parent read the gate
+  evidence and independently reran all six boundary-test files: **44 tests passed**,
+  seed `309148`. Proof: `/tmp/symphony-make-all-final.log`.
+- Use a stable `TMPDIR` across compilation and test invocations: Schema captures
+  its default temporary path when compiled, while context-mode can vary the
+  inherited temporary directory between calls.
 - Installer/preflight scripts: fourteen offline tests passed in the parent run.
 - Real installed-Codex schema and filesystem probe: passed, without a model turn.
-- Studio operator fix: 17 focused tests passed in both worker and independent
+- Studio operator fix: 36 focused tests passed in both worker and independent
   parent runs. Biome, typecheck, `verify:affected`, full `verify` and push checks
-  passed. The full gate selected no related source tests; the 17 script tests
-  provide the behavioral coverage. A separate Astra reviewer read the complete
-  four-file diff and call paths and found no actionable regression. Current
+  passed. The full gate selected no related source tests; the 36 script tests
+  provide the behavioral coverage. A separate Astra reviewer assessed the initial
+  four-file fix; the parent reviewed the complete workflow-validation follow-up
+  and found no actionable regression. Current
   Linear input-schema introspection confirmed additive/removal label fields;
   behavior tests used mocks, without test mutations to live issues.
 - Live UI review: all 18 viewport/data-state combinations plus interactions passed.
   A minor pre-existing event-metadata truncation without tooltip remains.
 
-Live preflight verified Codex 0.153.4, Astra/low, the current `spektra-org/spektra`
+Live preflight verified Codex 0.153.4, Astra/medium, the current `spektra-org/spektra`
 repository, staging commit `1b1e308fc9ffa1b480cb72849da36993933d376a`, the correct
 Linear project, opt-in routing, bounded settings and the isolated ledger path.
-Installed runtime: `~/.local/share/symphony-studio/runtimes/250385559f2928770e21`.
+Installed runtime: `~/.local/share/symphony-studio/runtimes/8e896dc9590726108ae6`.
 Original launcher/workflow backup: `~/.local/share/symphony-studio/backups/20260907T200136.549897Z`.
 Final launcher preflight returned `ready`, no candidates, and `agents_started: false`.
 No Studio runtime process or writer lock remains. The Salesight session remained
-running. No production deployment or merge occurred. The source Studio checkout
+running. The initial pilot performed no merge or production deployment. The source Studio checkout
 continued changing independently and was not used for this implementation.
+A real no-turn handshake of the exact canonical command returned `gpt-6-astra`,
+`medium` and `symphony_studio`, without request-side model/effort overrides.
+Concurrency remains one; the model name GPT-6 Astra does not imply six workers.
 
 ## Ledger measurement
 
@@ -102,8 +112,8 @@ token metrics, not currency estimates.
 The controlled Studio pilot is [SPK-1022](https://linear.app/ante-digital/issue/SPK-1022),
 which fixes existing operator commands that target nonexistent Linear statuses.
 Its scope is limited to the operator script, tests, guide and required changeset.
-Its operator fix now has a staging PR and independent review; human merge and
-deployment remain pending. See [operator instructions](../docs/studio-operations.md).
+Its operator fix now has a staging PR and independent review. The operator has
+authorized merge after the latest checks pass. See [operator instructions](../docs/studio-operations.md).
 
 ## Real pilot startup finding
 

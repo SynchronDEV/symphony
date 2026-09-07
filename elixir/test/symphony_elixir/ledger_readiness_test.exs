@@ -153,6 +153,36 @@ defmodule SymphonyElixir.LedgerReadinessTest do
     assert GenServer.call(recovered, {:get, "SPK-1"}).dispatch_count == 1
   end
 
+  test "lock write failures close the handle and remove the incomplete lock", %{root: root} do
+    path = Path.join(root, "ledger.json")
+    caller = self()
+
+    writer = fn file, _owner ->
+      send(caller, {:lock_file, file})
+      {:error, :enospc}
+    end
+
+    assert {:error, {:ledger_lock_failed, lock, :enospc}} =
+             Ledger.start_link(path: path, name: :readiness_ledger_a, lock_writer: writer)
+
+    assert lock == path <> ".lock"
+    assert_receive {:lock_file, file}
+    assert {:error, _} = :file.write(file, "closed")
+    refute File.exists?(lock)
+    refute File.exists?(path)
+    pid = ledger!(path, :readiness_ledger_a)
+    assert GenServer.call(pid, :all) == %{}
+  end
+
+  test "a lock creation failure reports the filesystem error", %{root: root} do
+    path = Path.join(root, String.duplicate("x", 253))
+
+    assert {:error, {:ledger_lock_failed, _, :enametoolong}} =
+             Ledger.start_link(path: path, name: :readiness_ledger_a)
+
+    refute File.exists?(path)
+  end
+
   defp ledger!(path, name) do
     start_supervised!(%{id: name, start: {Ledger, :start_link, [[path: path, name: name, flush_interval_ms: 60_000]]}})
   end

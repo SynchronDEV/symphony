@@ -21,7 +21,7 @@ The generic `symphony` launcher and Salesight configuration are not modified.
 | Stop labels | `symphony-hold`, `symphony-stuck` |
 | Workspace root | `~/code/spektra-symphony-workspaces` |
 | Cleanup merge evidence | `refs/remotes/origin/staging` |
-| Model | `gpt-6-astra`, reasoning effort `low` |
+| Model | `gpt-6-astra`, reasoning effort `medium` |
 | Approval policy | `granular`, all five approval categories explicitly `false` (reject requests) |
 | Filesystem profile | `symphony_studio`, extends `:workspace`; `.git` writable, `.codex` and `.agents` read-only; network enabled |
 | Limits | One worker; eight turns per invocation; 250,000 effective tokens per issue; three dispatches; two rework cycles |
@@ -127,7 +127,7 @@ Full preflight checks:
    extra writable roots, are rejected by Studio preflight. Studio requires `granular` with `sandbox_approval`,
    `rules`, `mcp_elicitations`, `request_permissions` and `skill_approval` all false;
    false means those requests are rejected. The CLI reports a full command hash,
-   never the raw command. It must match the exact reviewed Astra/low/profile command;
+   never the raw command. It must match the exact reviewed Astra/medium/profile command;
    extra or alternate flags and shell suffixes fail instead of being partially parsed.
    Schema checks do not prove model/account availability. `--full` remains accepted
    as a compatibility alias; policy checks are no longer optional.

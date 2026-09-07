@@ -525,7 +525,6 @@ defmodule SymphonyElixir.Config.Schema do
   defp resolve_optional_path_value(nil), do: nil
   defp resolve_optional_path_value(""), do: nil
   defp resolve_optional_path_value(value) when is_binary(value), do: resolve_path_value(value, nil)
-  defp resolve_optional_path_value(_value), do: nil
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
