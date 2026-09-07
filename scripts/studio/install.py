@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from preflight import CheckError, credentials, digest, require, run, schema_check
+from preflight import CheckError, credentials, digest, require, run, sandbox_check, schema_check
 
 
 def atomic_copy(source, destination, mode):
@@ -55,7 +55,8 @@ def install(args):
     env["SYMPHONY_STUDIO_CODEX_BIN"] = str(codex)
     report = json.loads(run([str(escript), str(binary), "--preflight", str(workflow_source)], env=env, cwd=repository))
     require(report.get("preflight") == "ok" and all(report["runtime"].values()), "Runtime does not support safe preflight")
-    schema_check(str(codex), env)
+    schema_check(str(codex), env, report.get("codex"))
+    sandbox_check(str(codex), env)
 
     sources = {"symphony": binary, "studio.md": workflow_source,
                "preflight.py": repository / "scripts/studio/preflight.py", "launch.py": repository / "scripts/studio/launch.py"}

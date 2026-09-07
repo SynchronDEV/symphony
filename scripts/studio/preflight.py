@@ -2,6 +2,7 @@
 """Read-only Studio checks. No Symphony supervisor, hooks or Codex turns start here."""
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -10,9 +11,18 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+
+
+PERMISSION_PROFILE = "symphony_studio"
+PERMISSION_CONFIG = 'permissions={symphony_studio={extends=":workspace",filesystem={":workspace_roots"={".git"="write",".codex"="read",".agents"="read"}},network={enabled=true}}}'
+COMMAND_CONFIG = ['default_permissions="symphony_studio"', PERMISSION_CONFIG,
+                  'model="gpt-6-astra"', 'model_reasoning_effort="low"']
+ENVIRONMENT_COMMAND = r'-c "shell_environment_policy.set={BUN_INSTALL_CACHE_DIR=\"$PWD/.git/symphony-runtime/bun-cache\",TMPDIR=\"$PWD/.git/symphony-runtime/tmp\"}"'
+CANONICAL_COMMAND = '"$SYMPHONY_STUDIO_CODEX_BIN" ' + " ".join("-c " + shlex.quote(value) for value in COMMAND_CONFIG) + " " + ENVIRONMENT_COMMAND + " app-server"
 
 
 class CheckError(Exception):
@@ -116,9 +126,137 @@ def tracker_check(settings, env):
     return candidates
 
 
-def schema_check(codex, env):
+def schema_valid(value, schema, document, depth=0):
+    """Validate the generated policy-schema subset; unknown constraints fail closed."""
+    require(isinstance(schema, dict) and isinstance(document, dict), "Codex policy schema must be an object")
+    require(depth < 64, "Codex policy schema recursion limit exceeded")
+    supported = {"$ref", "title", "description", "default", "type", "enum", "const", "oneOf", "anyOf", "allOf",
+                 "properties", "required", "additionalProperties", "items", "pattern", "minLength", "maxLength"}
+    require(not set(schema) - supported, "Codex policy schema contains an unsupported validation constraint")
+    if "$ref" in schema:
+        reference = schema["$ref"]
+        require(reference.startswith("#/definitions/"), "Codex policy schema contains an unsupported reference")
+        target = document["definitions"][reference.split("/")[-1]]
+        if not schema_valid(value, target, document, depth + 1):
+            return False
+    for keyword in ("oneOf", "anyOf", "allOf"):
+        if keyword in schema:
+            matches = [schema_valid(value, option, document, depth + 1) for option in schema[keyword]]
+            if (keyword == "oneOf" and sum(matches) != 1) or (keyword == "anyOf" and not any(matches)) or (keyword == "allOf" and not all(matches)):
+                return False
+    kind = schema.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    types = {"null": value is None, "object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "boolean": type(value) is bool,
+             "integer": type(value) is int, "number": type(value) in (int, float)}
+    if kind is not None and not any(types.get(candidate, False) for candidate in kinds):
+        return False
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    if "const" in schema and value != schema["const"]:
+        return False
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        if not set(schema.get("required", [])) <= value.keys():
+            return False
+        unknown = value.keys() - properties.keys()
+        additional = schema.get("additionalProperties", True)
+        if unknown and additional is False:
+            return False
+        if isinstance(additional, dict) and not all(schema_valid(value[key], additional, document, depth + 1) for key in unknown):
+            return False
+        if not all(schema_valid(value[key], properties[key], document, depth + 1) for key in value.keys() & properties.keys()):
+            return False
+    if isinstance(value, list) and "items" in schema:
+        return all(schema_valid(item, schema["items"], document, depth + 1) for item in value)
+    if isinstance(value, str):
+        if "pattern" in schema and not re.search(schema["pattern"], value):
+            return False
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", float("inf")):
+            return False
+    return True
+
+
+def validate_configured_policies(configured, thread_schema, turn_schema):
+    require(isinstance(configured, dict), "Runtime preflight lacks Codex policy details; rebuild and reinstall")
+    # Profile mode deliberately omits the two legacy sandbox fields on the wire.
+    checks = [(thread_schema, "approvalPolicy", "approval_policy"), (turn_schema, "approvalPolicy", "approval_policy")]
+    for document, property_name, setting in checks:
+        require(setting in configured and schema_valid(configured[setting], document["properties"][property_name], document),
+                f"Configured codex.{setting} is incompatible with the installed Codex schema")
+    categories = {"sandbox_approval", "rules", "mcp_elicitations", "request_permissions", "skill_approval"}
+    require(configured["approval_policy"] == {"granular": dict.fromkeys(categories, False)},
+            "Studio requires explicit granular approval flags set to false for all five categories")
+    require(configured.get("permission_profile") == PERMISSION_PROFILE,
+            "Studio requires its reviewed named permission profile")
+    # These are Config's legacy defaults, not wire overrides. Reject any explicit
+    # broadened turn policy, even though profile mode should ignore it.
+    require(configured.get("thread_sandbox") == "workspace-write" and configured.get("turn_sandbox_policy") is None,
+            "Studio profile mode forbids legacy sandbox overrides and additional writable roots")
+    expected = hashlib.sha256(CANONICAL_COMMAND.encode()).hexdigest()
+    require(configured.get("command_sha256") == expected,
+            "Studio command differs from the exact reviewed profile/model command; competing or unknown flags are forbidden")
+
+
+def sandbox_check(codex, env):
+    """Exercise filesystem permissions in disposable paths, without a model turn."""
+    probe = r'''import json, os, pathlib, subprocess, sys
+root = pathlib.Path.cwd(); outside = pathlib.Path(sys.argv[1]); result = {}
+for name, path in [("workspace", root / "write-check"), ("git_index", root / ".git/index.lock"),
+                   ("codex_write", root / ".codex/forbidden"), ("agents_write", root / ".agents/forbidden"),
+                   ("outside_write", outside / "forbidden")]:
+    try:
+        path.write_text("probe"); path.unlink(); result[name] = True
+    except OSError:
+        result[name] = False
+for name in (".codex", ".agents"):
+    try:
+        result[name + "_read"] = (root / name / "read-check").read_text() == "readable"
+    except OSError:
+        result[name + "_read"] = False
+result["git_branch"] = subprocess.run(["git", "switch", "-c", "codex/permission-probe"], capture_output=True).returncode == 0
+result["bun_environment"] = (os.environ.get("TMPDIR") == str(root / ".git/symphony-runtime/tmp") and
+    os.environ.get("BUN_INSTALL_CACHE_DIR") == str(root / ".git/symphony-runtime/bun-cache"))
+installed = subprocess.run([sys.argv[2], "install", "--frozen-lockfile", "--ignore-scripts"], capture_output=True)
+result["bun_install"] = installed.returncode == 0 and (root / "node_modules/probe-local/index.js").read_text() == "export default 42;\n"
+print(json.dumps(result))
+'''
+    with tempfile.TemporaryDirectory(prefix=".symphony-studio-sandbox-", dir=Path.home()) as workspace, \
+         tempfile.TemporaryDirectory(prefix=".symphony-studio-outside-", dir=Path.home()) as outside:
+        bun = shutil.which("bun", path=env.get("PATH"))
+        require(bun, "bun is missing")
+        root = Path(workspace)
+        run(["git", "init", "-q", workspace], env=env)
+        for name in (".git/symphony-runtime/tmp", ".git/symphony-runtime/bun-cache"):
+            (root / name).mkdir(parents=True)
+        package = {"name": "probe-local", "version": "1.0.0"}
+        with tarfile.open(root / "probe-local.tgz", "w:gz") as archive:
+            for name, data in [("package/package.json", json.dumps(package).encode()),
+                               ("package/index.js", b"export default 42;\n")]:
+                entry = tarfile.TarInfo(name); entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+        (root / "package.json").write_text(json.dumps({"name": "studio-permission-probe", "private": True,
+            "dependencies": {"probe-local": "file:./probe-local.tgz"}}))
+        bun_env = dict(env, TMPDIR=str(root / ".git/symphony-runtime/tmp"), BUN_INSTALL_CACHE_DIR=str(root / ".git/symphony-runtime/bun-cache"))
+        run([bun, "install", "--lockfile-only", "--ignore-scripts"], env=bun_env, cwd=workspace)
+        shutil.rmtree(root / ".git/symphony-runtime/bun-cache")
+        (root / ".git/symphony-runtime/bun-cache").mkdir()
+        for name in (".codex", ".agents"):
+            path = Path(workspace) / name
+            path.mkdir()
+            (path / "read-check").write_text("readable")
+        tool_environment = 'shell_environment_policy.set={BUN_INSTALL_CACHE_DIR=' + json.dumps(str(root / ".git/symphony-runtime/bun-cache")) + ',TMPDIR=' + json.dumps(str(root / ".git/symphony-runtime/tmp")) + '}'
+        output = run([codex, "sandbox", "-P", PERMISSION_PROFILE, "-C", workspace, "-c", PERMISSION_CONFIG, "-c", tool_environment,
+                      "--", sys.executable, "-c", probe, outside, bun], env=env, timeout=20)
+        expected = {"workspace": True, "git_index": True, "git_branch": True, "bun_install": True, "bun_environment": True,
+                    ".codex_read": True, ".agents_read": True,
+                    "codex_write": False, "agents_write": False, "outside_write": False}
+        require(json.loads(output) == expected, "Studio sandbox probe failed: Bun installation, Git writes or protected-path boundaries differ from the reviewed profile")
+
+
+def schema_check(codex, env, configured=None):
     with tempfile.TemporaryDirectory(prefix="symphony-studio-schema-") as directory:
-        run([codex, "app-server", "generate-json-schema", "--out", directory], env=env)
+        run([codex, "app-server", "generate-json-schema", "--experimental", "--out", directory], env=env)
         root = Path(directory) / "v2"
         interrupt = json.loads((root / "TurnInterruptParams.json").read_text())
         require({"threadId", "turnId"} <= set(interrupt["required"]), "Codex interrupt schema incompatible")
@@ -128,6 +266,11 @@ def schema_check(codex, env):
         require({"threadId", "turn"} <= set(completion["required"]), "Codex completion schema incompatible")
         turn = completion["definitions"]["Turn"]
         require({"id", "status", "error"} <= set(turn["properties"]), "Codex terminal status schema incompatible")
+        thread_schema = json.loads((root / "ThreadStartParams.json").read_text())
+        turn_schema = json.loads((root / "TurnStartParams.json").read_text())
+        validate_configured_policies(configured, thread_schema, turn_schema)
+        response = json.loads((root / "ThreadStartResponse.json").read_text())
+        require("activePermissionProfile" in response["properties"], "Codex cannot report the selected permission profile")
 
 
 def github_check(env):
@@ -164,9 +307,10 @@ def check(runtime, *, full=False, start=False):
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
     require(match and tuple(map(int, match.groups())) >= (0, 153, 4), "Codex 0.153.4 or newer is required")
     version = match.group(0)
-    # Full schema generation is opt-in, and repeated on a changed executable.
-    if full or digest(manifest["codex"]) != manifest["codex_sha256"]:
-        schema_check(manifest["codex"], env)
+    # Validate the actual selected policies every time, including when the binary
+    # hash matches. Version/field-presence checks alone cannot detect bad variants.
+    schema_check(manifest["codex"], env, report.get("codex"))
+    sandbox_check(manifest["codex"], env)
     run([manifest["codex"], "login", "status"], env=env)
     for executable in ("git", "bun", "gh"):
         require(shutil.which(executable, path=env.get("PATH")), f"{executable} is missing")
@@ -183,7 +327,7 @@ def check(runtime, *, full=False, start=False):
         require(len(candidates) == 1 and not candidates[0]["blocked"], "Pilot start requires exactly one opted-in, unblocked issue")
     result = {"result": "ready", "runtime": str(runtime), "source_repo": str(repo), "workflow": str(workflow),
               "workspace_root": report["workspace_root"], "ledger_path": report["ledger_path"], "base_branch": "staging",
-              "codex": version, "model": "gpt-6-astra", "reasoning_effort": "low", "limits": expected, "candidates": candidates,
+              "codex": version, "model": "gpt-6-astra", "reasoning_effort": "low", "permission_profile": PERMISSION_PROFILE, "limits": expected, "candidates": candidates,
               "source_branch": source_branch, "source_dirty_entries": dirty_entries, "remote_staging_sha": staging_sha,
               "github_default_branch": github["default_branch"], "agents_started": False}
     return result, manifest, env
@@ -192,7 +336,7 @@ def check(runtime, *, full=False, start=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", required=True)
-    parser.add_argument("--full", action="store_true", help="Regenerate and inspect the installed Codex protocol schema")
+    parser.add_argument("--full", action="store_true", help="Compatibility alias; every preflight validates the generated policy schemas")
     args = parser.parse_args()
     try:
         report, _, _ = check(args.runtime, full=args.full)

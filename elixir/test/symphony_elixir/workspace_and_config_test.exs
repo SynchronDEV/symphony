@@ -1253,6 +1253,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "explicit approval policies are preserved instead of rewritten to the current default" do
+    policies = [
+      "never",
+      "on-request",
+      %{"reject" => %{"sandbox_approval" => true, "rules" => true, "mcp_elicitations" => true}},
+      %{"granular" => %{"sandbox_approval" => true, "rules" => false, "mcp_elicitations" => true}}
+    ]
+
+    for policy <- policies do
+      write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: policy)
+      assert Config.settings!().codex.approval_policy == policy
+      assert {:ok, runtime} = Config.codex_runtime_settings()
+      assert runtime.approval_policy == policy
+    end
+  end
+
   test "config reads defaults for optional settings" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
@@ -1281,10 +1297,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.command == "codex app-server"
 
     assert config.codex.approval_policy == %{
-             "reject" => %{
-               "sandbox_approval" => true,
-               "rules" => true,
-               "mcp_elicitations" => true
+             "granular" => %{
+               "sandbox_approval" => false,
+               "rules" => false,
+               "mcp_elicitations" => false,
+               "request_permissions" => false,
+               "skill_approval" => false
              }
            }
 

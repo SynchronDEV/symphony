@@ -269,7 +269,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
-        :ok = append_token_usage_observation(issue_id, updated_running_entry, update, false)
+        :ok = append_token_usage_observation(issue_id, updated_running_entry, update, false, running_entry)
 
         Ledger.add_tokens(issue_id, token_delta)
         maybe_record_codex_ledger_event(issue_id, update)
@@ -3018,37 +3018,31 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_record_previous_attempt(_running_entry), do: :ok
 
-  defp append_token_usage_observation(issue_id, running_entry, update, final?) when is_map(running_entry) do
-    if token_usage_observation?(running_entry) do
-      TokenUsageLedger.append_observation(%{
-        observed_at: DateTime.utc_now(),
-        final: final?,
-        issue_id: issue_id,
-        issue_identifier: Map.get(running_entry, :identifier),
-        session_id: Map.get(running_entry, :session_id),
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path),
-        turn_count: Map.get(running_entry, :turn_count, 0),
-        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
-        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
-        total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
-        source_event: token_usage_source_event(update, final?)
-      })
+  defp append_token_usage_observation(issue_id, running_entry, update, final?, previous_entry \\ nil) do
+    if is_binary(Map.get(running_entry, :session_id)) do
+      observation = token_usage_observation(issue_id, running_entry, update, final?)
+      previous = if is_map(previous_entry), do: token_usage_observation(issue_id, previous_entry, nil, false)
+      TokenUsageLedger.append_observation(observation, previous_observation: previous)
     end
 
     :ok
   end
 
-  defp token_usage_observation?(running_entry) do
-    is_binary(Map.get(running_entry, :session_id)) and
-      Enum.any?(
-        [
-          Map.get(running_entry, :codex_input_tokens, 0),
-          Map.get(running_entry, :codex_output_tokens, 0),
-          Map.get(running_entry, :codex_total_tokens, 0)
-        ],
-        &(&1 > 0)
-      )
+  defp token_usage_observation(issue_id, entry, update, final?) do
+    %{
+      observed_at: DateTime.utc_now(),
+      final: final?,
+      issue_id: issue_id,
+      issue_identifier: Map.get(entry, :identifier),
+      session_id: Map.get(entry, :session_id),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      turn_count: Map.get(entry, :turn_count, 0),
+      input_tokens: Map.get(entry, :codex_input_tokens, 0),
+      output_tokens: Map.get(entry, :codex_output_tokens, 0),
+      total_tokens: Map.get(entry, :codex_total_tokens, 0),
+      source_event: token_usage_source_event(update, final?)
+    }
   end
 
   defp token_usage_source_event(_update, true), do: :session_final

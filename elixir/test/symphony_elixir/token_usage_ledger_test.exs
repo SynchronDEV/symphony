@@ -224,6 +224,59 @@ defmodule SymphonyElixir.TokenUsageLedgerTest do
     assert log =~ "Failed to append token usage ledger record"
   end
 
+  test "deduplicates notifications while preserving lifecycle and usage changes", %{ledger_file: file} do
+    attrs = %{
+      issue_identifier: "MT-DEDUPE",
+      session_id: "session",
+      input_tokens: 10,
+      output_tokens: 5,
+      total_tokens: 15,
+      turn_count: 1,
+      source_event: :notification
+    }
+
+    :ok = TokenUsageLedger.append_observation(attrs, file: file)
+
+    for event <- [:notification, :other_message, :stream_output] do
+      :ok = TokenUsageLedger.append_observation(%{attrs | source_event: event}, file: file, previous_observation: attrs)
+    end
+
+    assert length(TokenUsageLedger.read_records(file: file)) == 1
+    updated = %{attrs | total_tokens: 16, output_tokens: 6}
+    :ok = TokenUsageLedger.append_observation(updated, file: file, previous_observation: attrs)
+    completed = %{updated | source_event: :turn_completed}
+    :ok = TokenUsageLedger.append_observation(completed, file: file, previous_observation: updated)
+    :ok = TokenUsageLedger.append_observation(Map.put(updated, :final, true), file: file, previous_observation: updated)
+    assert length(TokenUsageLedger.read_records(file: file)) == 4
+    assert TokenUsageLedger.summary(file: file).total_tokens == 16
+  end
+
+  test "restart observations and zero-token lifecycle evidence are retained", %{ledger_file: file} do
+    attrs = %{
+      issue_identifier: "MT-RESTART",
+      session_id: "session",
+      input_tokens: 10,
+      output_tokens: 5,
+      total_tokens: 15
+    }
+
+    :ok = TokenUsageLedger.append_observation(attrs, file: file)
+    # A new controller has no previous in-memory observation; retain the replay.
+    :ok = TokenUsageLedger.append_observation(attrs, file: file)
+    assert length(TokenUsageLedger.read_records(file: file)) == 2
+    assert TokenUsageLedger.summary(file: file).total_tokens == 15
+    zero = %{attrs | session_id: "empty-session", input_tokens: 0, output_tokens: 0, total_tokens: 0}
+    failed = Map.put(zero, :source_event, :turn_failed)
+    :ok = TokenUsageLedger.append_observation(failed, file: file, previous_observation: zero)
+    :ok = TokenUsageLedger.append_observation(Map.put(zero, :final, true), file: file, previous_observation: zero)
+
+    assert [%{total_tokens: 0, source_event: "turn_failed"}, %{total_tokens: 0, final: true}] =
+             Enum.take(TokenUsageLedger.read_records(file: file), -2)
+
+    assert TokenUsageLedger.summary(file: file).total_tokens == 15
+    assert TokenUsageLedger.summary(file: file).session_count == 2
+  end
+
   defp append!(ledger_file, issue_identifier, session_id, input_tokens, output_tokens, total_tokens) do
     TokenUsageLedger.append_observation(
       %{

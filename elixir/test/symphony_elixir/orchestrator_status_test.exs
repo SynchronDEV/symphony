@@ -182,6 +182,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    # Unrelated events preserve the latest raw usage but must not append it again.
+    for event <- [:notification, :other_message, :stream_output] do
+      send(pid, {:codex_worker_update, issue_id, %{event: event, timestamp: now}})
+    end
+
+    # Same-sender ordering makes the snapshot a barrier for all notifications.
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.codex_app_server_pid == "4242"
@@ -194,6 +200,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     ledger_file = Application.fetch_env!(:symphony_elixir, :token_usage_ledger_file)
 
     assert [
+             %{
+               final: false,
+               session_id: "thread-usage-turn-usage",
+               input_tokens: 0,
+               output_tokens: 0,
+               total_tokens: 0,
+               source_event: "session_started"
+             },
              %{
                final: false,
                issue_id: ^issue_id,
@@ -215,7 +229,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert is_integer(completed_state.codex_totals.seconds_running)
 
     assert [
-             %{final: false},
+             %{final: false, source_event: "session_started", total_tokens: 0},
+             %{final: false, source_event: "notification", total_tokens: 16},
              %{
                final: true,
                issue_id: ^issue_id,

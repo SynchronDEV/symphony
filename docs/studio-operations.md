@@ -22,6 +22,8 @@ The generic `symphony` launcher and Salesight configuration are not modified.
 | Workspace root | `~/code/spektra-symphony-workspaces` |
 | Cleanup merge evidence | `refs/remotes/origin/staging` |
 | Model | `gpt-6-astra`, reasoning effort `low` |
+| Approval policy | `granular`, all five approval categories explicitly `false` (reject requests) |
+| Filesystem profile | `symphony_studio`, extends `:workspace`; `.git` writable, `.codex` and `.agents` read-only; network enabled |
 | Limits | One worker; eight turns per invocation; 250,000 effective tokens per issue; three dispatches; two rework cycles |
 | Poll interval | 60 seconds |
 | Dashboard | `http://127.0.0.1:4767` |
@@ -116,18 +118,39 @@ Full preflight checks:
    prompt rendering for every active role, without starting Symphony's supervisor.
 2. Elixir/OTP compatibility, readiness APIs, all configured pilot limits and roots.
 3. Codex 0.153.4 or newer, current login, and generated interrupt/completion/error
-   schema fields. Ordinary preflight skips schema generation when the executable's
-   hash matches the install-time checked binary; a changed executable is rechecked.
-4. Source checkout origin, GitHub repository identity, staging existence and
+   schema fields. Every preflight validates the actual configured approval policy,
+   approval-policy fields against the installed ThreadStart/TurnStart schemas,
+   even when the binary hash has not changed. Legacy `reject` variants fail before
+   dispatch. The named profile is selected by the exact reviewed command; runtime
+   startup must confirm its returned ID. Legacy sandbox wire overrides are omitted
+   because they clear the named profile. Explicit turn-policy overrides, including
+   extra writable roots, are rejected by Studio preflight. Studio requires `granular` with `sandbox_approval`,
+   `rules`, `mcp_elicitations`, `request_permissions` and `skill_approval` all false;
+   false means those requests are rejected. The CLI reports a full command hash,
+   never the raw command. It must match the exact reviewed Astra/low/profile command;
+   extra or alternate flags and shell suffixes fail instead of being partially parsed.
+   Schema checks do not prove model/account availability. `--full` remains accepted
+   as a compatibility alias; policy checks are no longer optional.
+4. A no-model `codex sandbox` probe creates a disposable Git workspace under the home directory
+   (outside inherited writable system-temp paths) and a separate home-directory sentinel. It creates a local package archive and frozen lockfile,
+   clears the package cache, then requires a real offline Bun install to extract
+   the expected module. Bun temporary/cache paths stay under the disposable
+   workspace's `.git/symphony-runtime/`. The probe checks Codex's configured tool
+   environment and runs bare Bun without an inline environment workaround. Git lock/branch writes and protected-file reads must
+   succeed; `.codex`, `.agents` and outside-home writes must fail. The temporary paths
+   are removed afterward. This detects permissions that parse but cannot perform
+   the task; no thread or turn is started.
+5. Source checkout origin, GitHub repository identity, staging existence and
    the current GitHub account's issue-branch push permission.
-5. Linear organization/project/statuses and all opted-in active issue identifiers,
+6. Linear organization/project/statuses and all opted-in active issue identifiers,
    with blockers and stop labels taken into account.
-6. The workflow-specific ledger path and any existing writer lock.
+7. The workflow-specific ledger path and any existing writer lock.
 
 The report includes source branch/dirty-entry count and remote staging commit, so
 local uncommitted Studio changes are not confused with the branch cloned for work.
-Preflight does not certify Studio app health, run editor tests, create workspaces,
-execute bootstrap hooks, modify Linear, migrate counters or spend Codex tokens.
+Preflight does not certify Studio app health, run editor tests, create issue
+workspaces, execute bootstrap hooks, modify Linear, migrate counters or spend
+Codex tokens. Its disposable sandbox probe only checks local filesystem permissions.
 The binary also supports a purely local check:
 
 ```sh
@@ -172,7 +195,15 @@ the pilot.
 
 New workspaces clone staging. Every run fetches the staging remote-tracking ref and
 runs `bun install --frozen-lockfile`; agents repeat installation after an actual
-branch switch. Failed new bootstrap is retried from a removed partial directory.
+branch switch. Hooks and agent Bun shells set `TMPDIR` and
+`BUN_INSTALL_CACHE_DIR` under `.git/symphony-runtime/` inside the assigned workspace.
+Hook exports do not persist into agent shells. The canonical Codex command sets
+`shell_environment_policy.set` using shell-expanded issue-workspace `$PWD`, so
+bare Bun commands inherit these paths deterministically. The workflow also
+repeats the setup explicitly as operator guidance. This avoids requiring global package-cache permissions. The offline
+preflight fixture checks local archive extraction, not every registry dependency
+or postinstall script used by Studio. No additional global writable roots are granted.
+Failed new bootstrap is retried from a removed partial directory.
 Established issue directories and edits are reused.
 
 Automated cleanup uses recorded paths and lifecycle state after worker termination.

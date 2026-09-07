@@ -99,6 +99,13 @@ defmodule SymphonyElixir.CLI do
               max_rework_cycles: settings.agent.max_rework_cycles,
               stop_continue_labels: settings.agent.stop_continue_labels
             },
+            codex: %{
+              approval_policy: settings.codex.approval_policy,
+              thread_sandbox: settings.codex.thread_sandbox,
+              turn_sandbox_policy: settings.codex.turn_sandbox_policy,
+              permission_profile: Map.get(settings.codex, :permission_profile),
+              command_sha256: :crypto.hash(:sha256, String.trim(settings.codex.command)) |> Base.encode16(case: :lower)
+            },
             polling_interval_ms: settings.polling.interval_ms,
             runtime: %{
               elixir: System.version(),

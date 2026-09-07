@@ -209,14 +209,17 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:approval_policy, StringOrMap,
         default: %{
-          "reject" => %{
-            "sandbox_approval" => true,
-            "rules" => true,
-            "mcp_elicitations" => true
+          "granular" => %{
+            "sandbox_approval" => false,
+            "rules" => false,
+            "mcp_elicitations" => false,
+            "request_permissions" => false,
+            "skill_approval" => false
           }
         }
       )
 
+      field(:permission_profile, :string)
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
@@ -238,6 +241,7 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :command,
           :approval_policy,
+          :permission_profile,
           :thread_sandbox,
           :turn_sandbox_policy,
           :turn_timeout_ms,
@@ -249,6 +253,7 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_format(:permission_profile, ~r/\A\S+\z/)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:startup_timeout_ms, greater_than: 0)

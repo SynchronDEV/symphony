@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Config do
 
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
+          permission_profile: String.t() | nil,
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           elicitation_policy: String.t()
@@ -131,6 +132,7 @@ defmodule SymphonyElixir.Config do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
+           permission_profile: settings.codex.permission_profile,
            thread_sandbox: settings.codex.thread_sandbox,
            turn_sandbox_policy: turn_sandbox_policy,
            elicitation_policy: settings.codex.elicitation_policy

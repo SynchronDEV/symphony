@@ -455,6 +455,11 @@ fields locally if they want stricter startup checks.
   - The launched process MUST speak a compatible app-server protocol over stdio.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
+- `permission_profile` (optional nonblank string, implementation extension)
+  - Expected named profile selected by the Codex command's `default_permissions` setting.
+  - When configured, omit legacy thread and turn sandbox override fields. Require the
+    `thread/start` response's `activePermissionProfile.id` to match before starting any turn.
+  - When omitted, preserve the existing sandbox configuration behavior.
 - `thread_sandbox` (Codex `SandboxMode` value)
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)

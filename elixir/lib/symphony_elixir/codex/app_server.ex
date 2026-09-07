@@ -16,6 +16,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           request_counter: :atomics.atomics_ref(),
           metadata: map(),
           approval_policy: String.t() | map(),
+          permission_profile: String.t() | nil,
           auto_approve_requests: boolean(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
@@ -52,6 +53,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            request_counter: :atomics.new(1, []),
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
+           permission_profile: session_policies.permission_profile,
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
@@ -328,50 +330,64 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, policies) do
+    params = %{
+      "approvalPolicy" => policies.approval_policy,
+      "cwd" => workspace,
+      "dynamicTools" => DynamicTool.tool_specs()
+    }
+
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
-      }
+      "params" => sandbox_override(params, "sandbox", policies.thread_sandbox, policies.permission_profile)
     })
 
-    case await_startup_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
-
-      other ->
-        other
+    with {:ok, result} <- await_startup_response(port, @thread_start_id),
+         :ok <- validate_permission_profile(result, policies.permission_profile) do
+      thread_id_from_response(result)
     end
   end
+
+  defp thread_id_from_response(%{"thread" => %{"id" => thread_id}}) when is_binary(thread_id), do: {:ok, thread_id}
+  defp thread_id_from_response(result), do: {:error, {:invalid_thread_payload, result}}
+
+  defp validate_permission_profile(_result, nil), do: :ok
+
+  defp validate_permission_profile(result, expected) do
+    actual =
+      case result do
+        %{"activePermissionProfile" => %{"id" => id}} -> id
+        _ -> nil
+      end
+
+    if actual == expected do
+      :ok
+    else
+      {:error, {:permission_profile_mismatch, expected, actual}}
+    end
+  end
+
+  # Legacy sandbox fields override named profiles in Codex; never mix the modes.
+  defp sandbox_override(params, key, value, nil), do: Map.put(params, key, value)
+  defp sandbox_override(params, _key, _value, _profile), do: params
 
   defp start_turn(session, prompt, issue) do
     request_id = next_request_id(session)
     port = session.port
 
+    params = %{
+      "threadId" => session.thread_id,
+      "input" => [%{"type" => "text", "text" => prompt}],
+      "cwd" => session.workspace,
+      "title" => "#{issue.identifier}: #{issue.title}",
+      "approvalPolicy" => session.approval_policy
+    }
+
     send_message(port, %{
       "method" => "turn/start",
       "id" => request_id,
-      "params" => %{
-        "threadId" => session.thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
-        "cwd" => session.workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => session.approval_policy,
-        "sandboxPolicy" => session.turn_sandbox_policy
-      }
+      "params" => sandbox_override(params, "sandboxPolicy", session.turn_sandbox_policy, session.permission_profile)
     })
 
     case await_response(port, request_id) do

@@ -136,10 +136,25 @@ Notes:
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
 - Safer Codex defaults are used when policy fields are omitted:
-  - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
+  - `codex.approval_policy` defaults to `{"granular":{"sandbox_approval":false,"rules":false,"mcp_elicitations":false,"request_permissions":false,"skill_approval":false}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
-- Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
+- Last verified: 2026-09-07 against Codex CLI 0.153.4's generated
+  [app-server protocol](https://developers.openai.com/codex/app-server). Its approval values are
+  `untrusted`, `on-request`, `never`, and object-form `granular`. Legacy `reject` and `on-failure`
+  are unsupported by this installed version. The default disables all five approval-prompt
+  categories; it does not grant additional permissions or automatically approve requests.
+- Explicit approval policies are forwarded unchanged, including policies intended for another
+  Codex version. Symphony does not silently migrate existing workflow permissions. Inspect the
+  installed contract with `codex app-server generate-json-schema --out <dir>` and update an
+  incompatible workflow deliberately before dispatch.
+- `codex.permission_profile` optionally selects the named permission profile expected from the
+  Codex command's `default_permissions` configuration. In this mode Symphony omits both
+  `thread/start.sandbox` and `turn/start.sandboxPolicy`, because these legacy overrides disable
+  named profiles. Startup fails before a turn if Codex's returned `activePermissionProfile.id`
+  does not exactly match. Configure and verify the profile in the launch command; Symphony does
+  not grant permissions by defining a profile name alone. With this field omitted, legacy sandbox
+  fields retain their existing behavior.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony forwards the configured map to
   Codex, but for `workspaceWrite` policies it ensures the current issue workspace stays in
