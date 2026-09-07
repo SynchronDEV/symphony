@@ -6,7 +6,7 @@ defmodule SymphonyElixir.StatusDashboard do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{Config, HttpServer}
+  alias SymphonyElixir.{CommandOutputPolicy, Config, HttpServer}
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
 
@@ -308,7 +308,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp snapshot_with_samples(token_samples, now_ms) do
     case snapshot_payload() do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
-        total_tokens = Map.get(codex_totals, :total_tokens, 0)
+        total_tokens = effective_total_tokens(codex_totals)
 
         {
           {:ok,
@@ -337,8 +337,10 @@ defmodule SymphonyElixir.StatusDashboard do
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
+        codex_cached_input_tokens = Map.get(codex_totals, :cached_input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
+        codex_effective_total_tokens = effective_total_tokens(codex_totals)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
         max_agents = Config.settings!().agent.max_concurrent_agents
@@ -359,9 +361,12 @@ defmodule SymphonyElixir.StatusDashboard do
            colorize("│ Tokens: ", @ansi_bold) <>
              colorize("in #{format_count(codex_input_tokens)}", @ansi_yellow) <>
              colorize(" | ", @ansi_gray) <>
+             colorize("cached #{format_count(codex_cached_input_tokens)}", @ansi_yellow) <>
+             colorize(" | ", @ansi_gray) <>
              colorize("out #{format_count(codex_output_tokens)}", @ansi_yellow) <>
              colorize(" | ", @ansi_gray) <>
-             colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
+             colorize("effective #{format_count(codex_effective_total_tokens)}", @ansi_yellow) <>
+             colorize(" / raw #{format_count(codex_total_tokens)}", @ansi_gray),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
@@ -593,7 +598,7 @@ defmodule SymphonyElixir.StatusDashboard do
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
-    total_tokens = running_entry.codex_total_tokens || 0
+    total_tokens = running_entry_effective_total_tokens(running_entry)
     runtime_seconds = running_entry.runtime_seconds || 0
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
@@ -1046,10 +1051,38 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp snapshot_total_tokens({:ok, %{codex_totals: codex_totals}}) when is_map(codex_totals) do
-    Map.get(codex_totals, :total_tokens, 0)
+    effective_total_tokens(codex_totals)
   end
 
   defp snapshot_total_tokens(_snapshot_data), do: 0
+
+  defp effective_total_tokens(tokens) when is_map(tokens) do
+    case Map.get(tokens, :effective_total_tokens) || Map.get(tokens, "effective_total_tokens") do
+      value when is_integer(value) ->
+        value
+
+      _ ->
+        raw = Map.get(tokens, :total_tokens) || Map.get(tokens, "total_tokens") || 0
+        cached = Map.get(tokens, :cached_input_tokens) || Map.get(tokens, "cached_input_tokens") || 0
+        max(raw - cached, 0)
+    end
+  end
+
+  defp effective_total_tokens(_tokens), do: 0
+
+  defp running_entry_effective_total_tokens(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :codex_effective_total_tokens) do
+      value when is_integer(value) ->
+        value
+
+      _ ->
+        max(
+          Map.get(running_entry, :codex_total_tokens, 0) -
+            Map.get(running_entry, :codex_cached_input_tokens, 0),
+          0
+        )
+    end
+  end
 
   defp format_timestamp(datetime) do
     datetime
@@ -1321,8 +1354,16 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_method("item/reasoning/textDelta", payload),
     do: humanize_streaming_event("reasoning text streaming", payload)
 
-  defp humanize_codex_method("item/commandExecution/outputDelta", payload),
-    do: humanize_streaming_event("command output streaming", payload)
+  defp humanize_codex_method("item/commandExecution/outputDelta", payload) do
+    output =
+      map_path(payload, ["params", "outputDelta"]) ||
+        map_path(payload, [:params, :outputDelta])
+
+    case CommandOutputPolicy.compact_output_delta(output) do
+      compacted when is_binary(compacted) -> compacted
+      _ -> humanize_streaming_event("command output streaming", payload)
+    end
+  end
 
   defp humanize_codex_method("item/fileChange/outputDelta", payload),
     do: humanize_streaming_event("file change output streaming", payload)
@@ -1502,7 +1543,22 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_wrapper_event("turn_diff", _payload), do: "turn diff updated"
   defp humanize_codex_wrapper_event("exec_command_begin", payload), do: humanize_exec_command_begin(payload)
   defp humanize_codex_wrapper_event("exec_command_end", payload), do: humanize_exec_command_end(payload)
-  defp humanize_codex_wrapper_event("exec_command_output_delta", _payload), do: "command output streaming"
+
+  defp humanize_codex_wrapper_event("exec_command_output_delta", payload) do
+    output =
+      map_path(payload, ["params", "msg", "delta"]) ||
+        map_path(payload, ["params", "msg", "output"]) ||
+        map_path(payload, ["params", "msg", "payload", "delta"]) ||
+        map_path(payload, [:params, :msg, :delta]) ||
+        map_path(payload, [:params, :msg, :output]) ||
+        map_path(payload, [:params, :msg, :payload, :delta])
+
+    case CommandOutputPolicy.compact_output_delta(output) do
+      compacted when is_binary(compacted) -> compacted
+      _ -> "command output streaming"
+    end
+  end
+
   defp humanize_codex_wrapper_event("mcp_tool_call_begin", _payload), do: "mcp tool call started"
   defp humanize_codex_wrapper_event("mcp_tool_call_end", _payload), do: "mcp tool call completed"
 
@@ -1537,7 +1593,7 @@ defmodule SymphonyElixir.StatusDashboard do
     command = normalize_command(command)
 
     if is_binary(command) do
-      command
+      CommandOutputPolicy.compact_command_status(command) || command
     else
       "command started"
     end

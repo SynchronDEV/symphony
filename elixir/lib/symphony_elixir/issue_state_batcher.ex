@@ -13,6 +13,7 @@ defmodule SymphonyElixir.IssueStateBatcher do
   defstruct pending: %{},
             pending_ids: MapSet.new(),
             timer_ref: nil,
+            in_flight: nil,
             fetcher: nil,
             batch_delay_ms: @batch_delay_ms
 
@@ -76,37 +77,62 @@ defmodule SymphonyElixir.IssueStateBatcher do
   end
 
   @impl true
-  def handle_info(:flush, %__MODULE__{} = state) do
-    pending = state.pending
+  def handle_info(:flush, %__MODULE__{in_flight: nil} = state) do
     ids = MapSet.to_list(state.pending_ids)
+    fetcher = state.fetcher
+    task = Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn -> fetcher.(ids) end)
+    timer = Process.send_after(self(), {:batch_timeout, task.ref}, @call_timeout_ms)
+
+    {:noreply, %{state | pending: %{}, pending_ids: MapSet.new(), timer_ref: nil, in_flight: %{task: task, pending: state.pending, timer: timer}}}
+  end
+
+  def handle_info(:flush, state), do: {:noreply, %{state | timer_ref: nil}}
+
+  def handle_info({ref, result}, %__MODULE__{in_flight: %{task: %{ref: ref}}} = state) do
+    Process.demonitor(ref, [:flush])
+    finish_batch(state, result)
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %__MODULE__{in_flight: %{task: %{ref: ref}}} = state) do
+    finish_batch(state, {:error, {:issue_state_batch_failed, reason}})
+  end
+
+  def handle_info({:batch_timeout, ref}, %__MODULE__{in_flight: %{task: %{ref: ref, pid: pid}}} = state) do
+    Process.exit(pid, :kill)
+    Process.demonitor(ref, [:flush])
+    finish_batch(state, {:error, :issue_state_batch_timeout})
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp finish_batch(state, result) do
+    Process.cancel_timer(state.in_flight.timer)
 
     result =
-      case state.fetcher.(ids) do
+      case result do
         {:ok, issues} when is_list(issues) ->
-          issues_by_id =
-            Map.new(issues, fn
-              %{id: issue_id} = issue -> {issue_id, issue}
-              issue -> {inspect(issue), issue}
-            end)
+          if Enum.all?(issues, &match?(%{id: id} when is_binary(id), &1)),
+            do: {:ok, Map.new(issues, &{&1.id, &1})},
+            else: {:error, :invalid_issue_state_result}
 
-          {:ok, issues_by_id}
+        {:error, _} = error ->
+          error
 
-        {:error, reason} ->
-          {:error, reason}
+        other ->
+          {:error, {:invalid_issue_state_result, other}}
       end
 
-    Enum.each(pending, fn {_request_ref, %{from: from, ids: requested_ids}} ->
-      GenServer.reply(from, reply_for_request(requested_ids, result))
+    Enum.each(state.in_flight.pending, fn {_ref, %{from: from, ids: ids}} ->
+      GenServer.reply(from, reply_for_request(ids, result))
     end)
 
-    {:noreply, %{state | pending: %{}, pending_ids: MapSet.new(), timer_ref: nil}}
+    {:noreply, schedule_flush(%{state | in_flight: nil})}
   end
 
-  defp schedule_flush(%__MODULE__{timer_ref: timer_ref} = state) when is_reference(timer_ref), do: state
-
-  defp schedule_flush(%__MODULE__{} = state) do
-    %{state | timer_ref: Process.send_after(self(), :flush, state.batch_delay_ms)}
-  end
+  defp schedule_flush(%__MODULE__{in_flight: flight} = state) when not is_nil(flight), do: state
+  defp schedule_flush(%__MODULE__{timer_ref: ref} = state) when is_reference(ref), do: state
+  defp schedule_flush(%__MODULE__{pending: pending} = state) when map_size(pending) == 0, do: state
+  defp schedule_flush(state), do: %{state | timer_ref: Process.send_after(self(), :flush, state.batch_delay_ms)}
 
   defp reply_for_request(requested_ids, {:ok, issues_by_id}) do
     issues =

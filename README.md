@@ -36,6 +36,13 @@ help with the setup:
 
 ---
 
+## Spektra Studio readiness
+
+This fork includes guarded workspace cleanup, non-blocking tracker reconciliation, strict Codex
+turn handling, and deployment-isolated accounting. The opt-in Studio workflow starts with one
+worker and hands validated staging PRs to a human. See
+[Studio operations](docs/studio-operations.md) for installation, preflight, rollout, and recovery.
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

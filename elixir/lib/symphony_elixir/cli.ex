@@ -3,10 +3,11 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.LogFile
+  alias SymphonyElixir.{Config, Ledger, LogFile, PromptBuilder, Workflow}
+  alias SymphonyElixir.Linear.Issue
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
+  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer, preflight: :boolean]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
   @type deps :: %{
@@ -23,33 +24,106 @@ defmodule SymphonyElixir.CLI do
       :ok ->
         wait_for_shutdown()
 
+      {:ok, :preflight} ->
+        System.halt(0)
+
       {:error, message} ->
         IO.puts(:stderr, message)
         System.halt(1)
     end
   end
 
-  @spec evaluate([String.t()], deps()) :: :ok | {:error, String.t()}
+  @spec evaluate([String.t()], deps()) :: :ok | {:ok, :preflight} | {:error, String.t()}
   def evaluate(args, deps \\ runtime_deps()) do
     case OptionParser.parse(args, strict: @switches) do
       {opts, [], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
-          run(Path.expand("WORKFLOW.md"), deps)
-        end
+        evaluate_workflow(Path.expand("WORKFLOW.md"), opts, deps)
 
       {opts, [workflow_path], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
-          run(workflow_path, deps)
-        end
+        evaluate_workflow(workflow_path, opts, deps)
 
       _ ->
         {:error, usage_message()}
     end
   end
+
+  defp evaluate_workflow(workflow_path, opts, deps) do
+    if Keyword.get(opts, :preflight, false) do
+      preflight(workflow_path)
+    else
+      with :ok <- require_guardrails_acknowledgement(opts),
+           :ok <- maybe_set_logs_root(opts, deps),
+           :ok <- maybe_set_server_port(opts, deps) do
+        run(workflow_path, deps)
+      end
+    end
+  end
+
+  @doc "Validate the installed runtime and workflow without starting Symphony or dispatching work."
+  @spec preflight(Path.t()) :: {:ok, :preflight} | {:error, String.t()}
+  def preflight(workflow_path) do
+    previous_path = Application.get_env(:symphony_elixir, :workflow_file_path)
+
+    try do
+      # YAML decoding needs its dependency application, never Symphony's supervisor.
+      with {:ok, _} <- Application.ensure_all_started(:yaml_elixir),
+           :ok <- Workflow.set_workflow_file_path(Path.expand(workflow_path)),
+           :ok <- Config.validate!() do
+        settings = Config.settings!()
+
+        for state <- settings.tracker.active_states do
+          PromptBuilder.build_prompt(%Issue{id: "preflight", identifier: "SPK-PREFLIGHT", title: "Read-only preflight", state: state})
+        end
+
+        IO.puts(
+          Jason.encode!(%{
+            preflight: "ok",
+            workflow: Path.expand(workflow_path),
+            workspace_root: Config.local_workspace_root(),
+            ledger_path: Ledger.path_for_workflow(workflow_path),
+            cleanup_base_ref: Map.get(settings.workspace, :cleanup_base_ref),
+            tracker: %{
+              kind: settings.tracker.kind,
+              endpoint: settings.tracker.endpoint,
+              project_slug: settings.tracker.project_slug,
+              required_labels: settings.tracker.required_labels,
+              active_states: settings.tracker.active_states,
+              terminal_states: settings.tracker.terminal_states,
+              credential_present: is_binary(settings.tracker.api_key) and settings.tracker.api_key != ""
+            },
+            agent: %{
+              max_concurrent_agents: settings.agent.max_concurrent_agents,
+              max_turns: settings.agent.max_turns,
+              max_tokens_per_issue: settings.agent.max_tokens_per_issue,
+              max_dispatch_attempts: settings.agent.max_dispatch_attempts,
+              max_rework_cycles: settings.agent.max_rework_cycles,
+              stop_continue_labels: settings.agent.stop_continue_labels
+            },
+            polling_interval_ms: settings.polling.interval_ms,
+            runtime: %{
+              elixir: System.version(),
+              otp: System.otp_release(),
+              recorded_cleanup: supported?(SymphonyElixir.Workspace, :remove_completed, 2),
+              turn_interrupt: supported?(SymphonyElixir.Codex.AppServer, :interrupt_turn, 2)
+            }
+          })
+        )
+
+        {:ok, :preflight}
+      else
+        _ -> {:error, "Preflight failed: workflow or credentials are invalid. No agents were started."}
+      end
+    rescue
+      _ -> {:error, "Preflight failed: runtime, workflow or prompt validation failed. No agents were started."}
+    after
+      if previous_path,
+        do: Workflow.set_workflow_file_path(previous_path),
+        else: Workflow.clear_workflow_file_path()
+    end
+  end
+
+  defp supported?(module, function, arity),
+    do: Code.ensure_loaded?(module) and function_exported?(module, function, arity)
 
   @spec run(String.t(), deps()) :: :ok | {:error, String.t()}
   def run(workflow_path, deps) do
@@ -72,7 +146,7 @@ defmodule SymphonyElixir.CLI do
 
   @spec usage_message() :: String.t()
   defp usage_message do
-    "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
+    "Usage: symphony [--preflight] [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
   end
 
   @spec runtime_deps() :: deps()

@@ -62,6 +62,22 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec max_turns_for_state(term(), pos_integer()) :: pos_integer()
+  def max_turns_for_state(state_name, default_max_turns)
+      when is_binary(state_name) and is_integer(default_max_turns) and default_max_turns > 0 do
+    config = settings!()
+
+    Map.get(
+      config.agent.max_turns_by_state,
+      Schema.normalize_issue_state(state_name),
+      default_max_turns
+    )
+  end
+
+  def max_turns_for_state(_state_name, default_max_turns)
+      when is_integer(default_max_turns) and default_max_turns > 0,
+      do: default_max_turns
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
@@ -90,6 +106,13 @@ defmodule SymphonyElixir.Config do
       port when is_integer(port) and port >= 0 -> port
       _ -> settings!().server.port
     end
+  end
+
+  @doc false
+  @spec local_workspace_root() :: Path.t()
+  def local_workspace_root do
+    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+    Path.expand(settings!().workspace.root, workflow_dir)
   end
 
   @spec validate!() :: :ok | {:error, term()}

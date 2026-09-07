@@ -42,10 +42,42 @@ defmodule SymphonyElixir.Linear.RateLimitBudget do
   @spec low?() :: boolean()
   def low? do
     case current() do
-      %{remaining: remaining} when is_integer(remaining) -> remaining < @threshold
-      _ -> false
+      %{remaining: remaining, reset_at: reset_at, updated_at: updated_at} when is_integer(remaining) ->
+        deadline = reset_at || DateTime.add(updated_at, 60, :second)
+        remaining < @threshold and DateTime.compare(deadline, DateTime.utc_now()) == :gt
+
+      _ ->
+        false
     end
   end
+
+  @doc "Returns quota denial immediately and permits only one probe after an exhausted window expires."
+  @spec acquire_read() :: :ok | {:error, {:rate_limited, DateTime.t() | nil}}
+  def acquire_read do
+    if Process.whereis(__MODULE__) do
+      Agent.get_and_update(__MODULE__, &read_decision/1)
+    else
+      :ok
+    end
+  end
+
+  defp read_decision(nil), do: {:ok, nil}
+
+  defp read_decision(%{remaining: remaining} = budget) when is_integer(remaining) and remaining < @threshold do
+    now = DateTime.utc_now()
+    deadline = budget.reset_at || DateTime.add(budget.updated_at, 60, :second)
+    probe_until = Map.get(budget, :probe_until)
+
+    probe_active? = not is_nil(probe_until) and DateTime.compare(probe_until, now) == :gt
+
+    cond do
+      DateTime.compare(deadline, now) == :gt -> {{:error, {:rate_limited, budget.reset_at}}, budget}
+      probe_active? -> {{:error, {:rate_limited, probe_until}}, budget}
+      true -> {:ok, Map.put(budget, :probe_until, DateTime.add(now, 30, :second))}
+    end
+  end
+
+  defp read_decision(budget), do: {:ok, budget}
 
   @spec reset_at() :: DateTime.t() | nil
   def reset_at do
