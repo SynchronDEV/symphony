@@ -182,6 +182,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
        }}
     )
 
+    # Unrelated events preserve the latest raw usage but must not append it again.
+    for event <- [:notification, :other_message, :stream_output] do
+      send(pid, {:codex_worker_update, issue_id, %{event: event, timestamp: now}})
+    end
+
+    # Same-sender ordering makes the snapshot a barrier for all notifications.
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.codex_app_server_pid == "4242"
@@ -194,6 +200,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     ledger_file = Application.fetch_env!(:symphony_elixir, :token_usage_ledger_file)
 
     assert [
+             %{
+               final: false,
+               session_id: "thread-usage-turn-usage",
+               input_tokens: 0,
+               output_tokens: 0,
+               total_tokens: 0,
+               source_event: "session_started"
+             },
              %{
                final: false,
                issue_id: ^issue_id,
@@ -215,7 +229,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert is_integer(completed_state.codex_totals.seconds_running)
 
     assert [
-             %{final: false},
+             %{final: false, source_event: "session_started", total_tokens: 0},
+             %{final: false, source_event: "notification", total_tokens: 16},
              %{
                final: true,
                issue_id: ^issue_id,
@@ -316,6 +331,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.blocked, issue_id)
     assert SymphonyElixir.Ledger.get(issue_id).cumulative_tokens == 5
+    assert state.running[issue_id].codex_cached_input_tokens == 95
+    assert state.running[issue_id].codex_effective_total_tokens == 5
+    assert state.codex_totals.cached_input_tokens == 95
+    assert state.codex_totals.effective_total_tokens == 5
+    assert state.codex_totals.total_tokens == 100
 
     # Next absolute report: +102 raw, +93 cached => +9 billable => 14 total,
     # which breaches the 10 budget on real spend.
@@ -346,7 +366,91 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_receive {:memory_tracker_label, ^issue_id, "symphony-budget-exceeded"}
     assert_receive {:memory_tracker_comment, ^issue_id, comment}
-    assert comment =~ "Total tokens: 14"
+    assert comment =~ "Effective tokens: 14"
+  end
+
+  test "session completion preserves effective cached-token budget accounting" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_tokens_per_issue: 10
+    )
+
+    issue_id = "issue-token-budget-completion"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-903",
+      title: "Budget completion cached exclusion",
+      description: "Session completion must not overwrite effective spend with raw totals",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-903"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CachedCompletionBudgetOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    worker_ref = Process.monitor(worker_pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: worker_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-budget-completion",
+      workspace_path: "/tmp/workspaces/MT-903",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_effective_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_completed,
+         payload: %{
+           method: "turn/completed",
+           usage: %{
+             input_tokens: 95,
+             output_tokens: 5,
+             total_tokens: 100,
+             cached_input_tokens: 95
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    Process.sleep(50)
+    assert SymphonyElixir.Ledger.get(issue_id).cumulative_tokens == 5
+
+    send(pid, {:DOWN, worker_ref, :process, worker_pid, :normal})
+    Process.sleep(50)
+
+    assert SymphonyElixir.Ledger.get(issue_id).cumulative_tokens == 5
   end
 
   test "token budget breach blocks running issue with label and comment" do
@@ -430,7 +534,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert_receive {:memory_tracker_label, ^issue_id, "symphony-budget-exceeded"}
     assert_receive {:memory_tracker_comment, ^issue_id, comment}
     assert comment =~ "exceeded the configured token budget"
-    assert comment =~ "Total tokens: 12"
+    assert comment =~ "Effective tokens: 12"
     assert comment =~ "Budget: 10"
   end
 
@@ -1107,12 +1211,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator poll cycle resets next refresh countdown after a check" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: nil,
-      poll_interval_ms: 50
+      tracker_kind: "memory",
+      poll_interval_ms: 5_000
     )
 
     orchestrator_name = Module.concat(__MODULE__, :PollCycleOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    parent = self()
+
+    fetcher = fn _ ->
+      send(parent, {:countdown_poll_waiting, self()})
+
+      receive do
+        :complete_countdown_poll -> {:ok, []}
+      end
+    end
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, candidate_fetcher: fetcher)
 
     on_exit(fn ->
       if Process.alive?(pid) do
@@ -1120,21 +1234,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end)
 
-    :sys.replace_state(pid, fn state ->
-      %{
-        state
-        | poll_interval_ms: 50,
-          poll_check_in_progress: true,
-          next_poll_due_at_ms: nil
-      }
-    end)
+    assert_receive {:countdown_poll_waiting, startup_poll}, 1_000
+    assert Orchestrator.snapshot(orchestrator_name, 200).polling.checking?
+    send(startup_poll, :complete_countdown_poll)
+    wait_for_snapshot(pid, &(&1.polling.checking? == false), 1_000)
 
-    send(pid, :run_poll_cycle)
+    send(pid, :tick)
+    assert_receive {:countdown_poll_waiting, refresh_poll}, 1_000
+    assert Orchestrator.snapshot(orchestrator_name, 200).polling.checking?
+    send(refresh_poll, :complete_countdown_poll)
 
     snapshot =
       wait_for_snapshot(pid, fn
-        %{polling: %{checking?: false, poll_interval_ms: 50, next_poll_in_ms: next_poll_in_ms}}
-        when is_integer(next_poll_in_ms) and next_poll_in_ms <= 50 ->
+        %{polling: %{checking?: false, poll_interval_ms: 5_000, next_poll_in_ms: next_poll_in_ms}}
+        when is_integer(next_poll_in_ms) and next_poll_in_ms <= 5_000 ->
           true
 
         _ ->
@@ -1144,14 +1257,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{
              polling: %{
                checking?: false,
-               poll_interval_ms: 50,
+               poll_interval_ms: 5_000,
                next_poll_in_ms: next_poll_in_ms
              }
            } = snapshot
 
     assert is_integer(next_poll_in_ms)
     assert next_poll_in_ms >= 0
-    assert next_poll_in_ms <= 50
+    assert next_poll_in_ms <= 5_000
   end
 
   test "orchestrator restarts stalled workers with retry backoff" do
@@ -2124,6 +2237,35 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     }
 
     assert StatusDashboard.humanize_codex_message(message) == "git status --short"
+  end
+
+  test "status dashboard summarizes noisy ci watch command output" do
+    command_message = %{
+      event: :notification,
+      message: %{
+        "method" => "codex/event/exec_command_begin",
+        "params" => %{"msg" => %{"command" => "gh run watch 123 --exit-status"}}
+      }
+    }
+
+    output_message = %{
+      event: :notification,
+      message: %{
+        "method" => "item/commandExecution/outputDelta",
+        "params" => %{
+          "outputDelta" => """
+          Refreshing run status every 3 seconds. Press Ctrl+C to quit.
+
+          * branch Build and Analyze org/repo#123
+          JOBS
+          * Build
+          """
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_codex_message(command_message) =~ "sparse polling"
+    assert StatusDashboard.humanize_codex_message(output_message) =~ "ci watch output suppressed"
   end
 
   test "status dashboard formats auto-approval updates from codex" do

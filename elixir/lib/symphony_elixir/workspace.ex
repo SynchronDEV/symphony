@@ -42,9 +42,15 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-        {:ok, workspace}
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
+        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+          :ok ->
+            {:ok, workspace}
+
+          {:error, _reason} = error ->
+            cleanup_failed_new_workspace(workspace, created?, worker_host)
+            error
+        end
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
@@ -112,6 +118,7 @@ defmodule SymphonyElixir.Workspace do
         {:ok, workspace, true}
 
       {:error, reason} ->
+        cleanup_failed_new_workspace(workspace, true, nil)
         {:error, reason}
     end
   end
@@ -199,20 +206,7 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
-    case File.exists?(workspace) do
-      true ->
-        case validate_workspace_path(workspace, nil) do
-          :ok ->
-            maybe_run_before_remove_hook(workspace, nil)
-            File.rm_rf(workspace)
-
-          {:error, reason} ->
-            {:error, reason, ""}
-        end
-
-      false ->
-        File.rm_rf(workspace)
-    end
+    remove_recorded(workspace, nil, Config.local_workspace_root())
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
@@ -234,6 +228,54 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason, ""}
+    end
+  end
+
+  @doc "Remove an explicitly recorded path using its original root, independent of configuration reloads."
+  @spec remove_recorded(Path.t(), worker_host(), Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, nil, recorded_root) do
+    case validate_recorded_workspace_path(workspace, recorded_root) do
+      :ok -> remove_after_hook(workspace, recorded_root)
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  def remove_recorded(workspace, worker_host, recorded_root)
+      when is_binary(workspace) and is_binary(worker_host) and is_binary(recorded_root) do
+    # Remote automated deletion is deliberately preserved by remove_completed/2
+    # until remote clean/merge evidence is implemented.
+    remove(workspace, worker_host)
+  end
+
+  def remove_recorded(workspace, _worker_host, _recorded_root),
+    do: {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
+
+  defp remove_after_hook(workspace, root) do
+    maybe_run_before_remove_hook(workspace, nil)
+
+    case validate_recorded_workspace_path(workspace, root) do
+      :ok -> File.rm_rf(workspace)
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  defp validate_recorded_workspace_path(workspace, root) when is_binary(workspace) and is_binary(root) do
+    if Path.type(workspace) == :absolute and Path.type(root) == :absolute do
+      validate_recorded_child(workspace, root)
+    else
+      {:error, {:workspace_path_unreadable, workspace, :not_absolute}}
+    end
+  end
+
+  defp validate_recorded_workspace_path(workspace, _root),
+    do: {:error, {:workspace_path_unreadable, workspace, :invalid}}
+
+  defp validate_recorded_child(workspace, root) do
+    with :ok <- validate_local_workspace_path(workspace, root),
+         {:ok, canonical} <- PathSafety.canonicalize(workspace),
+         {:ok, canonical_root} <- PathSafety.canonicalize(root) do
+      expected = Path.join(canonical_root, Path.basename(Path.expand(workspace)))
+      if canonical == expected, do: :ok, else: {:error, {:workspace_symlink_escape, workspace, root}}
     end
   end
 
@@ -273,61 +315,85 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
-  @spec enforce_retention() :: :ok
-  def enforce_retention do
-    root = Config.settings!().workspace.root
+  @doc """
+  Removes only explicitly registered, completed, clean and merged workspaces.
 
-    with true <- File.dir?(root),
-         {:ok, entries} <- File.ls(root) do
-      workspaces =
-        entries
-        |> Enum.map(&Path.join(root, &1))
-        |> Enum.filter(&File.dir?/1)
-        |> Enum.map(fn path -> {path, modified_time(path), directory_size(path)} end)
-        |> Enum.sort_by(fn {_path, modified_at, _size} -> modified_at end, {:desc, DateTime})
+  The caller must supply a live eligibility check which excludes running,
+  claimed, queued, retrying and blocked issues. Missing evidence preserves data.
+  The limits apply only to eligible records, ordered by completion time.
+  """
+  @spec enforce_retention([map()], (map() -> boolean())) :: :ok
+  def enforce_retention(records \\ [], still_eligible? \\ fn _record -> false end) do
+    eligible =
+      records
+      |> Enum.filter(&(completed_workspace_safe?(&1) and still_eligible?.(&1)))
+      |> Enum.sort_by(& &1.completed_at, {:desc, DateTime})
 
-      remove_by_count(workspaces, Config.settings!().workspace.keep_last_n)
-      remove_by_size(workspaces, Config.settings!().workspace.max_total_gb)
-    end
+    settings = Config.settings!().workspace
+    keep_count = settings.keep_last_n
+    max_bytes = if is_number(settings.max_total_gb), do: trunc(settings.max_total_gb * 1024 * 1024 * 1024)
+
+    _retained_bytes = Enum.reduce(Enum.with_index(eligible), 0, &retain_or_remove(&1, &2, keep_count, max_bytes, still_eligible?))
 
     :ok
   end
 
-  defp remove_by_count(workspaces, keep_last_n) when is_integer(keep_last_n) and keep_last_n >= 0 do
-    workspaces
-    |> Enum.drop(keep_last_n)
-    |> Enum.each(fn {path, _modified_at, _size} -> remove(path, nil) end)
-  end
+  defp retain_or_remove({record, index}, retained_bytes, keep_count, max_bytes, still_eligible?) do
+    size = directory_size(record.workspace_path)
+    count_exceeded? = is_integer(keep_count) and keep_count >= 0 and index >= keep_count
+    size_exceeded? = is_integer(max_bytes) and retained_bytes + size > max_bytes
 
-  defp remove_by_count(_workspaces, _keep_last_n), do: :ok
-
-  defp remove_by_size(_workspaces, nil), do: :ok
-
-  defp remove_by_size(workspaces, max_total_gb) when is_number(max_total_gb) do
-    max_bytes = trunc(max_total_gb * 1024 * 1024 * 1024)
-
-    {_total, to_remove} =
-      Enum.reduce(workspaces, {0, []}, fn {path, _modified_at, size}, {total, remove_acc} ->
-        next_total = total + size
-
-        if next_total > max_bytes do
-          {total, [path | remove_acc]}
-        else
-          {next_total, remove_acc}
-        end
-      end)
-
-    Enum.each(to_remove, &remove(&1, nil))
-  end
-
-  defp remove_by_size(_workspaces, _max_total_gb), do: :ok
-
-  defp modified_time(path) do
-    case File.stat(path, time: :posix) do
-      {:ok, %{mtime: mtime}} -> DateTime.from_unix!(mtime)
-      _ -> ~U[1970-01-01 00:00:00Z]
+    if count_exceeded? or size_exceeded? do
+      remove_completed(record, fn -> still_eligible?.(record) end)
+      retained_bytes
+    else
+      retained_bytes + size
     end
   end
+
+  @doc "Automated cleanup: preserve unless lifecycle, Git, path and live ownership checks all pass."
+  @spec remove_completed(map(), (-> boolean())) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_completed(record, still_eligible? \\ fn -> false end) do
+    if completed_workspace_safe?(record) and still_eligible?.() do
+      maybe_run_before_remove_hook(record.workspace_path, nil)
+
+      # Hooks may dirty or replace a workspace. Check again after the hook and
+      # immediately before deletion; the caller holds the cleanup claim here.
+      if completed_workspace_safe?(record) and still_eligible?.() do
+        File.rm_rf(record.workspace_path)
+      else
+        {:error, {:workspace_preserved, :eligibility_changed}, ""}
+      end
+    else
+      {:error, {:workspace_preserved, :missing_completion_or_merge_proof}, ""}
+    end
+  end
+
+  defp completed_workspace_safe?(%{
+         workspace_path: workspace,
+         workspace_root: root,
+         worker_host: nil,
+         status: :completed,
+         eligible: true,
+         completed_at: %DateTime{},
+         merged_into: merged_into
+       })
+       when is_binary(workspace) and is_binary(root) and is_binary(merged_into) and merged_into != "" do
+    with true <- String.starts_with?(merged_into, "refs/remotes/"),
+         :ok <- validate_recorded_workspace_path(workspace, root),
+         {"", 0} <- System.cmd("git", ["-C", workspace, "status", "--porcelain=v1", "--untracked-files=all"], stderr_to_stdout: true),
+         {_output, 0} <- System.cmd("git", ["-C", workspace, "merge-base", "--is-ancestor", "HEAD", merged_into], stderr_to_stdout: true),
+         {"", 0} <- System.cmd("git", ["-C", workspace, "rev-list", "--branches", "--not", merged_into], stderr_to_stdout: true),
+         {"", 0} <- System.cmd("git", ["-C", workspace, "for-each-ref", "--format=%(refname)", "refs/stash"], stderr_to_stdout: true) do
+      true
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp completed_workspace_safe?(_record), do: false
 
   # credo:disable-for-lines:23 Credo.Check.Refactor.Nesting
   defp directory_size(path) do
@@ -385,7 +451,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
-    Config.settings!().workspace.root
+    Config.local_workspace_root()
     |> Path.join(safe_id)
     |> PathSafety.canonicalize()
   end
@@ -414,6 +480,21 @@ defmodule SymphonyElixir.Workspace do
       false ->
         :ok
     end
+  end
+
+  defp cleanup_failed_new_workspace(_workspace, false, _worker_host), do: :ok
+
+  defp cleanup_failed_new_workspace(workspace, true, nil) do
+    # Never invoke before_remove for an incomplete bootstrap. Revalidate against
+    # the physical parent captured in the newly created path, not reloaded config.
+    with :ok <- validate_recorded_workspace_path(workspace, Path.dirname(workspace)) do
+      File.rm_rf(workspace)
+    end
+  end
+
+  defp cleanup_failed_new_workspace(workspace, true, worker_host) do
+    script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
+    run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
   end
 
   defp maybe_run_before_remove_hook(workspace, nil) do
@@ -551,8 +632,26 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do
+    validate_local_workspace_path(workspace, Config.local_workspace_root())
+  end
+
+  defp validate_workspace_path(workspace, worker_host)
+       when is_binary(workspace) and is_binary(worker_host) do
+    cond do
+      String.trim(workspace) == "" ->
+        {:error, {:workspace_path_unreadable, workspace, :empty}}
+
+      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
+        {:error, {:workspace_path_unreadable, workspace, :invalid_characters}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_local_workspace_path(workspace, root) do
     expanded_workspace = Path.expand(workspace)
-    expanded_root = Path.expand(Config.settings!().workspace.root)
+    expanded_root = Path.expand(root)
     expanded_root_prefix = expanded_root <> "/"
 
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
@@ -575,20 +674,6 @@ defmodule SymphonyElixir.Workspace do
     else
       {:error, {:path_canonicalize_failed, path, reason}} ->
         {:error, {:workspace_path_unreadable, path, reason}}
-    end
-  end
-
-  defp validate_workspace_path(workspace, worker_host)
-       when is_binary(workspace) and is_binary(worker_host) do
-    cond do
-      String.trim(workspace) == "" ->
-        {:error, {:workspace_path_unreadable, workspace, :empty}}
-
-      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
-        {:error, {:workspace_path_unreadable, workspace, :invalid_characters}}
-
-      true ->
-        :ok
     end
   end
 

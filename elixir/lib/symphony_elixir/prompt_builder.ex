@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{CommandOutputPolicy, Config, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -24,6 +24,11 @@ defmodule SymphonyElixir.PromptBuilder do
       @render_opts
     )
     |> IO.iodata_to_binary()
+    |> append_runtime_efficiency_guardrails()
+  end
+
+  defp append_runtime_efficiency_guardrails(prompt) when is_binary(prompt) do
+    prompt <> CommandOutputPolicy.prompt_guardrails()
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}, issue) do

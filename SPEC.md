@@ -236,9 +236,12 @@ Fields:
 - `last_codex_timestamp` (timestamp or null)
 - `last_codex_message` (summarized payload)
 - `codex_input_tokens` (integer)
+- `codex_cached_input_tokens` (integer)
 - `codex_output_tokens` (integer)
 - `codex_total_tokens` (integer)
+- `codex_effective_total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
+- `last_reported_cached_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
@@ -421,6 +424,11 @@ Fields:
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
   - Invalid values fail configuration validation.
+- `max_turns_by_state` (map `state_name -> positive integer`)
+  - Default: empty map.
+  - Overrides `max_turns` for the current tracker state.
+  - State keys are normalized (`lowercase`) for lookup.
+  - Invalid entries fail configuration validation.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
@@ -447,6 +455,11 @@ fields locally if they want stricter startup checks.
   - The launched process MUST speak a compatible app-server protocol over stdio.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
+- `permission_profile` (optional nonblank string, implementation extension)
+  - Expected named profile selected by the Codex command's `default_permissions` setting.
+  - When configured, omit legacy thread and turn sandbox override fields. Require the
+    `thread/start` response's `activePermissionProfile.id` to match before starting any turn.
+  - When omitted, preserve the existing sandbox configuration behavior.
 - `thread_sandbox` (Codex `SandboxMode` value)
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
@@ -594,6 +607,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
+- `agent.max_turns_by_state`: map of positive integers, default `{}`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -637,7 +651,11 @@ Important nuance:
 - The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
+  coding-agent thread in the same workspace, up to the effective turn cap for that state:
+  `agent.max_turns_by_state[state]` if present, otherwise `agent.max_turns`.
+- If the refreshed issue is still active but has crossed an implementation/review role boundary,
+  the worker SHOULD stop and return control to the orchestrator instead of continuing the same
+  coding-agent thread across the handoff.
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
@@ -823,20 +841,23 @@ Part B: Tracker state refresh
 
 - Fetch current issue states for all running issue IDs.
 - For each running issue:
-  - If tracker state is terminal: terminate worker and clean workspace.
+  - If tracker state is terminal: confirm worker termination, then consider safe workspace cleanup.
   - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
 ### 8.6 Startup Terminal Workspace Cleanup
 
-When the service starts:
+Cleanup MUST use captured workspace paths and roots, not paths reconstructed from current configuration.
+The Elixir fork only considers recorded completed workspaces for automatic retention. It MUST preserve
+unknown, active, blocked, dirty, stashed, or unmerged workspaces. A Git-backed workflow must explicitly
+configure `workspace.cleanup_base_ref` as a remote-tracking ref, and HEAD plus every local branch must
+be ancestors of that ref before deletion. Live ownership is checked again immediately before removal.
+Startup does not delete directories from issue identifiers alone. Missing proof preserves files.
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
-
-This prevents stale terminal workspaces from accumulating after restarts.
+Tracker I/O, rate-limit waits, and cleanup MUST NOT block the orchestrator mailbox. In-flight operations
+reserve capacity and apply results only to matching operation and worker identities. Restarting the
+orchestrator MUST also stop the workers it owned before empty bookkeeping can dispatch replacements.
 
 ## 9. Workspace Management and Safety
 
@@ -867,6 +888,7 @@ Algorithm summary:
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
 5. If `created_now=true`, run `after_create` hook if configured.
+6. If fresh bootstrap fails, remove its partial workspace so a retry runs bootstrap again.
 
 Notes:
 
@@ -1004,11 +1026,15 @@ the active turn terminates.
 
 Completion conditions:
 
-- Targeted-protocol turn completion signal -> success
+- Matching thread/turn completion with explicit `completed` status and no error -> success
 - Targeted-protocol turn failure signal -> failure
 - Targeted-protocol turn cancellation signal -> failure
 - turn timeout (`turn_timeout_ms`) -> failure
 - subprocess exit -> failure
+
+Unknown or malformed terminal status MUST fail closed. Retryable error notifications keep waiting.
+Notifications for other thread/turn identities MUST NOT end the active turn. A timed-out turn may
+continue only after a supported `turn/interrupt` is acknowledged and its terminal notification received.
 
 Continuation processing:
 
@@ -1130,7 +1156,7 @@ User-input-required policy:
 Timeouts:
 
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
+- `codex.turn_timeout_ms`: idle turn stream timeout, renewed by incoming updates
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
@@ -1320,8 +1346,10 @@ SHOULD return:
 - session and retry rows SHOULD include the tracker-provided issue URL when available
 - `codex_totals`
   - `input_tokens`
+  - `cached_input_tokens`
   - `output_tokens`
-  - `total_tokens`
+  - `total_tokens` (raw provider-reported total)
+  - `effective_total_tokens` (`total_tokens - cached_input_tokens`, clamped at zero)
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `token_usage` (optional durable token summary across completed and active sessions)
   - `input_tokens`
@@ -1353,6 +1381,9 @@ Token accounting rules:
   - `thread/tokenUsage/updated` payloads
   - `total_token_usage` within token-count wrapper events
 - Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
+- Preserve raw and cached token counters separately. Budget enforcement and headline dashboard
+  spend SHOULD use effective tokens (`total_tokens - cached_input_tokens`) so cached prompt-prefix
+  rereads do not prematurely pause healthy issues.
 - Extract input/output/total token counts leniently from common field names within the selected
   payload.
 - For absolute totals, track deltas relative to last reported totals to avoid double-counting.
@@ -1459,8 +1490,10 @@ Minimum endpoints:
           "last_event_at": "2026-02-24T20:14:59Z",
           "tokens": {
             "input_tokens": 1200,
+            "cached_input_tokens": 700,
             "output_tokens": 800,
-            "total_tokens": 2000
+            "total_tokens": 2000,
+            "effective_total_tokens": 1300
           }
         }
       ],
@@ -1489,8 +1522,10 @@ Minimum endpoints:
       "expired": [],
       "codex_totals": {
         "input_tokens": 5000,
+        "cached_input_tokens": 3000,
         "output_tokens": 2400,
         "total_tokens": 7400,
+        "effective_total_tokens": 4400,
         "seconds_running": 1834.2
       },
       "token_usage": {
@@ -1531,8 +1566,10 @@ Minimum endpoints:
         "last_event_at": "2026-02-24T20:14:59Z",
         "tokens": {
           "input_tokens": 1200,
+          "cached_input_tokens": 700,
           "output_tokens": 800,
-          "total_tokens": 2000
+          "total_tokens": 2000,
+          "effective_total_tokens": 1300
         }
       },
       "retry": null,
@@ -1770,7 +1807,7 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    codex_totals: {input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, total_tokens: 0, effective_total_tokens: 0, seconds_running: 0},
     codex_rate_limits: null
   }
 
@@ -1868,9 +1905,12 @@ function dispatch_issue(issue, state, attempt):
     last_codex_event: null,
     last_codex_timestamp: null,
     codex_input_tokens: 0,
+    codex_cached_input_tokens: 0,
     codex_output_tokens: 0,
     codex_total_tokens: 0,
+    codex_effective_total_tokens: 0,
     last_reported_input_tokens: 0,
+    last_reported_cached_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
     retry_attempt: normalize_attempt(attempt),
@@ -1898,10 +1938,11 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
 
-  max_turns = config.agent.max_turns
+  default_max_turns = config.agent.max_turns
   turn_number = 1
 
   while true:
+    max_turns = config.agent.max_turns_by_state[issue.state] or default_max_turns
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
       app_server.stop_session(session)
@@ -1926,10 +1967,16 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
+    previous_issue = issue
     issue = refreshed_issue[0] or issue
 
     if issue.state is not active:
       break
+
+    if active_role_changed(previous_issue, issue):
+      break
+
+    max_turns = config.agent.max_turns_by_state[issue.state] or default_max_turns
 
     if turn_number >= max_turns:
       break

@@ -102,7 +102,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns_for_issue_state(issue, max_turns))
 
     case AppServer.run_turn(
            app_session,
@@ -114,24 +114,18 @@ defmodule SymphonyElixir.AgentRunner do
         Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
         case continue_with_issue?(issue, issue_state_fetcher) do
-          {:continue, refreshed_issue} when turn_number < max_turns ->
-            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-            do_run_codex_turns(
+          {:continue, refreshed_issue} ->
+            continue_or_stop_at_state_cap(
               app_session,
               workspace,
               refreshed_issue,
               codex_update_recipient,
               opts,
               issue_state_fetcher,
-              turn_number + 1,
-              max_turns
+              turn_number,
+              max_turns,
+              :normal_completion
             )
-
-          {:continue, refreshed_issue} ->
-            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-            :ok
 
           {:done, _refreshed_issue} ->
             :ok
@@ -153,23 +147,38 @@ defmodule SymphonyElixir.AgentRunner do
             {:error, reason}
         end
 
-      {:error, timeout_reason} when timeout_reason in [:turn_timeout, :stall_timeout] and turn_number < max_turns ->
-        Logger.warning("Codex turn #{timeout_reason_for_log(timeout_reason)} for #{issue_context(issue)}; interrupting thread and continuing on same session turn=#{turn_number}/#{max_turns}")
-        _ = AppServer.interrupt_thread(app_session)
+      {:error, {timeout_reason, turn_id}} when timeout_reason in [:turn_timeout, :stall_timeout] ->
+        max_turns_for_state = max_turns_for_issue_state(issue, max_turns)
 
-        do_run_codex_turns(
-          app_session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          put_timeout_previous_attempt(opts, turn_number),
-          issue_state_fetcher,
-          turn_number + 1,
-          max_turns
-        )
+        if turn_number < max_turns_for_state do
+          Logger.warning(
+            "Codex turn #{timeout_reason_for_log(timeout_reason)} for #{issue_context(issue)}; interrupting active turn and continuing on same session turn=#{turn_number}/#{max_turns_for_state}"
+          )
+
+          turn = %{turn_id: turn_id, turn_number: turn_number, max_turns: max_turns}
+          recipient = codex_update_recipient
+          continue_interrupted_turn(app_session, workspace, issue, recipient, opts, issue_state_fetcher, turn)
+        else
+          {:error, timeout_reason}
+        end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp continue_interrupted_turn(app_session, workspace, issue, recipient, opts, issue_state_fetcher, turn) do
+    with :ok <- AppServer.interrupt_turn(app_session, turn.turn_id) do
+      do_run_codex_turns(
+        app_session,
+        workspace,
+        issue,
+        recipient,
+        put_timeout_previous_attempt(opts, turn.turn_number),
+        issue_state_fetcher,
+        turn.turn_number + 1,
+        turn.max_turns
+      )
     end
   end
 
@@ -179,7 +188,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
+    - The previous Codex turn has ended, and the Linear issue is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
@@ -216,23 +225,18 @@ defmodule SymphonyElixir.AgentRunner do
     sleep_for_issue_pause(reason)
 
     case continue_with_issue?(issue, issue_state_fetcher) do
-      {:continue, refreshed_issue} when turn_number < max_turns ->
-        Logger.info("Resuming paused agent run for #{issue_context(refreshed_issue)} on same Codex session turn=#{turn_number}/#{max_turns}")
-
-        do_run_codex_turns(
+      {:continue, refreshed_issue} ->
+        continue_or_stop_at_state_cap(
           app_session,
           workspace,
           refreshed_issue,
           codex_update_recipient,
           opts,
           issue_state_fetcher,
-          turn_number + 1,
-          max_turns
+          turn_number,
+          max_turns,
+          :paused_refresh
         )
-
-      {:continue, refreshed_issue} ->
-        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} after paused issue refresh; returning control to orchestrator")
-        :ok
 
       {:done, _refreshed_issue} ->
         :ok
@@ -271,6 +275,56 @@ defmodule SymphonyElixir.AgentRunner do
     |> Process.sleep()
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp continue_or_stop_at_state_cap(
+         app_session,
+         workspace,
+         refreshed_issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns,
+         continuation_context
+       ) do
+    max_turns_for_state = max_turns_for_issue_state(refreshed_issue, max_turns)
+
+    if turn_number < max_turns_for_state do
+      Logger.info(continuation_log_message(refreshed_issue, turn_number, max_turns_for_state, continuation_context))
+
+      do_run_codex_turns(
+        app_session,
+        workspace,
+        refreshed_issue,
+        codex_update_recipient,
+        opts,
+        issue_state_fetcher,
+        turn_number + 1,
+        max_turns
+      )
+    else
+      Logger.info(max_turns_reached_log_message(refreshed_issue, turn_number, max_turns_for_state, continuation_context))
+
+      :ok
+    end
+  end
+
+  defp continuation_log_message(issue, turn_number, max_turns_for_state, :normal_completion) do
+    "Continuing agent run for #{issue_context(issue)} after normal turn completion turn=#{turn_number}/#{max_turns_for_state}"
+  end
+
+  defp continuation_log_message(issue, turn_number, max_turns_for_state, :paused_refresh) do
+    "Resuming paused agent run for #{issue_context(issue)} on same Codex session turn=#{turn_number}/#{max_turns_for_state}"
+  end
+
+  defp max_turns_reached_log_message(issue, turn_number, max_turns_for_state, :normal_completion) do
+    "Reached agent max turns for #{issue_context(issue)} state=#{inspect(issue.state)} turn=#{turn_number}/#{max_turns_for_state}; returning control to orchestrator"
+  end
+
+  defp max_turns_reached_log_message(issue, turn_number, max_turns_for_state, :paused_refresh) do
+    "Reached agent max turns for #{issue_context(issue)} state=#{inspect(issue.state)} after paused issue refresh turn=#{turn_number}/#{max_turns_for_state}; returning control to orchestrator"
+  end
+
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case fetch_issue_for_continuation(issue, issue_state_fetcher) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
@@ -280,27 +334,13 @@ defmodule SymphonyElixir.AgentRunner do
         # max_rework_cycles (observed: 4 cycles in one session).
         Ledger.observe_state(issue_id, refreshed_issue.state)
 
-        cond do
-          not active_issue_state?(refreshed_issue.state) ->
-            {:done, refreshed_issue}
-
-          stop_continue_label?(refreshed_issue) ->
-            Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue carries a stop-continue label while still in an active state; returning control to orchestrator")
-
-            {:done, refreshed_issue}
-
-          !issue_routable?(refreshed_issue) ->
-            Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue is no longer routed to this worker")
-
-            {:done, refreshed_issue}
-
-          rework_cap_exhausted?(refreshed_issue) ->
-            Logger.info("Not continuing #{issue_context(refreshed_issue)}: max_rework_cycles reached; returning control to orchestrator")
-
-            {:done, refreshed_issue}
-
-          true ->
+        case continuation_stop_reason(issue, refreshed_issue, include_rework_cap?: true) do
+          nil ->
             {:continue, refreshed_issue}
+
+          reason ->
+            log_continuation_stop(reason, issue, refreshed_issue)
+            {:done, refreshed_issue}
         end
 
       {:ok, []} ->
@@ -355,23 +395,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp sleep_for_issue_refresh(_reason), do: Process.sleep(@issue_refresh_retry_ms)
 
-  defp continue_with_refreshed_issue(_issue, {:ok, [%Issue{} = refreshed_issue | _]}) do
-    cond do
-      not active_issue_state?(refreshed_issue.state) ->
-        {:done, refreshed_issue}
-
-      stop_continue_label?(refreshed_issue) ->
-        Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue carries a stop-continue label while still in an active state; returning control to orchestrator")
-
-        {:done, refreshed_issue}
-
-      !issue_routable?(refreshed_issue) ->
-        Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue is no longer routed to this worker")
-
-        {:done, refreshed_issue}
-
-      true ->
+  defp continue_with_refreshed_issue(issue, {:ok, [%Issue{} = refreshed_issue | _]}) do
+    case continuation_stop_reason(issue, refreshed_issue, include_rework_cap?: false) do
+      nil ->
         {:continue, refreshed_issue}
+
+      reason ->
+        log_continuation_stop(reason, issue, refreshed_issue)
+        {:done, refreshed_issue}
     end
   end
 
@@ -386,6 +417,46 @@ defmodule SymphonyElixir.AgentRunner do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
+  defp continuation_stop_reason(issue, refreshed_issue, opts) do
+    cond do
+      not active_issue_state?(refreshed_issue.state) ->
+        :inactive
+
+      stop_continue_label?(refreshed_issue) ->
+        :stop_continue_label
+
+      !issue_routable?(refreshed_issue) ->
+        :unroutable
+
+      active_role_changed?(issue, refreshed_issue) ->
+        :active_role_changed
+
+      Keyword.get(opts, :include_rework_cap?, false) and rework_cap_exhausted?(refreshed_issue) ->
+        :rework_cap_exhausted
+
+      true ->
+        nil
+    end
+  end
+
+  defp log_continuation_stop(:inactive, _issue, _refreshed_issue), do: :ok
+
+  defp log_continuation_stop(:stop_continue_label, _issue, refreshed_issue) do
+    Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue carries a stop-continue label while still in an active state; returning control to orchestrator")
+  end
+
+  defp log_continuation_stop(:unroutable, _issue, refreshed_issue) do
+    Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue is no longer routed to this worker")
+  end
+
+  defp log_continuation_stop(:active_role_changed, issue, refreshed_issue) do
+    Logger.info("Not continuing #{issue_context(refreshed_issue)}: issue moved from #{inspect(issue.state)} to #{inspect(refreshed_issue.state)} active role; returning control to orchestrator")
+  end
+
+  defp log_continuation_stop(:rework_cap_exhausted, _issue, refreshed_issue) do
+    Logger.info("Not continuing #{issue_context(refreshed_issue)}: max_rework_cycles reached; returning control to orchestrator")
+  end
+
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
 
@@ -394,6 +465,25 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp active_issue_state?(_state_name), do: false
+
+  defp active_role_changed?(%Issue{} = issue, %Issue{} = refreshed_issue) do
+    active_role(issue.state) != active_role(refreshed_issue.state)
+  end
+
+  defp active_role(state_name) when is_binary(state_name) do
+    case normalize_issue_state(state_name) do
+      "in review" -> :review
+      _state_name -> :implementation
+    end
+  end
+
+  defp active_role(_state_name), do: :implementation
+
+  defp max_turns_for_issue_state(%Issue{state: state_name}, default_max_turns) do
+    Config.max_turns_for_state(state_name, default_max_turns)
+  end
+
+  defp max_turns_for_issue_state(_issue, default_max_turns), do: default_max_turns
 
   defp selected_worker_host(nil, []), do: nil
 

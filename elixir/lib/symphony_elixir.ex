@@ -25,11 +25,11 @@ defmodule SymphonyElixir.Application do
 
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
       SymphonyElixir.Ledger,
       SymphonyElixir.Linear.RateLimitBudget,
       SymphonyElixir.IssueStateBatcher,
       SymphonyElixir.WorkflowStore,
+      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
       SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard
@@ -37,7 +37,9 @@ defmodule SymphonyElixir.Application do
 
     Supervisor.start_link(
       children,
-      strategy: :one_for_one,
+      # Orchestrator state and paid workers form one failure domain: never
+      # restart empty dispatch bookkeeping while the old workers are alive.
+      strategy: :one_for_all,
       name: SymphonyElixir.Supervisor
     )
   end

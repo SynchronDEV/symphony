@@ -122,14 +122,25 @@ defmodule SymphonyElixir.TestSupport do
           max_dispatch_attempts: nil,
           max_rework_cycles: nil,
           max_concurrent_agents_by_state: %{},
+          max_turns_by_state: %{},
           prompt_template_by_state: %{},
           stop_continue_labels: [],
           codex_command: "codex app-server",
-          codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
+          codex_approval_policy: %{
+            granular: %{
+              sandbox_approval: false,
+              rules: false,
+              mcp_elicitations: false,
+              request_permissions: false,
+              skill_approval: false
+            }
+          },
+          codex_permission_profile: nil,
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
+          codex_startup_timeout_ms: 60_000,
           codex_stall_timeout_ms: 300_000,
           codex_elicitation_policy: "decline",
           hook_after_create: nil,
@@ -171,14 +182,17 @@ defmodule SymphonyElixir.TestSupport do
     max_dispatch_attempts = Keyword.get(config, :max_dispatch_attempts)
     max_rework_cycles = Keyword.get(config, :max_rework_cycles)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    max_turns_by_state = Keyword.get(config, :max_turns_by_state)
     prompt_template_by_state = Keyword.get(config, :prompt_template_by_state)
     stop_continue_labels = Keyword.get(config, :stop_continue_labels)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
+    codex_permission_profile = Keyword.get(config, :codex_permission_profile)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
+    codex_startup_timeout_ms = Keyword.get(config, :codex_startup_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
     codex_elicitation_policy = Keyword.get(config, :codex_elicitation_policy)
     hook_after_create = Keyword.get(config, :hook_after_create)
@@ -223,15 +237,18 @@ defmodule SymphonyElixir.TestSupport do
         "  max_dispatch_attempts: #{yaml_value(max_dispatch_attempts)}",
         "  max_rework_cycles: #{yaml_value(max_rework_cycles)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "  max_turns_by_state: #{yaml_value(max_turns_by_state)}",
         "  prompt_template_by_state: #{yaml_value(prompt_template_by_state)}",
         "  stop_continue_labels: #{yaml_value(stop_continue_labels)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
+        "  permission_profile: #{yaml_value(codex_permission_profile)}",
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
+        "  startup_timeout_ms: #{yaml_value(codex_startup_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         "  elicitation_policy: #{yaml_value(codex_elicitation_policy)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),

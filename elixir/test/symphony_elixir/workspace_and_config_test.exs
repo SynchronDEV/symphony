@@ -473,6 +473,23 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_history_page, ^query, %{issueId: "issue-1", first: 100, after: "cursor-1"}}
   end
 
+  test "history counts review failures routed to Ready or Todo without double counting Rework" do
+    graphql = fn query, _variables ->
+      assert query =~ "fromState"
+
+      nodes = [
+        %{"fromState" => %{"name" => "In Review"}, "toState" => %{"name" => "Todo"}},
+        %{"fromState" => %{"name" => "In Review"}, "toState" => %{"name" => "Ready for Agent"}},
+        %{"fromState" => %{"name" => "In Review"}, "toState" => %{"name" => "Rework"}},
+        %{"fromState" => %{"name" => "Backlog"}, "toState" => %{"name" => "Todo"}}
+      ]
+
+      {:ok, %{"data" => %{"issue" => %{"history" => %{"nodes" => nodes, "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}}}}}
+    end
+
+    assert {:ok, 3} = Client.fetch_issue_rework_count_for_test("history", graphql)
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -502,7 +519,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
-  test "linear client retries structured Linear rate limit responses" do
+  test "linear client returns structured rate limits without sleeping or retrying inline" do
     parent = self()
     reset_at = DateTime.utc_now() |> DateTime.add(-1, :second) |> DateTime.to_unix()
 
@@ -535,15 +552,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       end
     end
 
-    assert {:ok, %{"data" => %{}}} =
+    assert {:error, {:rate_limited, %DateTime{}}} =
              Client.graphql("query Viewer { viewer { id } }", %{},
                request_fun: request_fun,
                sleep_fun: fn ms -> send(parent, {:linear_rate_limit_sleep, ms}) end
              )
 
     assert_receive {:linear_request, 1}
-    assert_receive {:linear_rate_limit_sleep, 0}
-    assert_receive {:linear_request, 2}
+    refute_receive {:linear_rate_limit_sleep, _}
+    refute_receive {:linear_request, 2}
   end
 
   test "linear client returns structured rate limit errors after retries are exhausted" do
@@ -573,7 +590,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              )
   end
 
-  test "linear client rate-limit retry waits a fallback delay when no reset timestamp is known" do
+  test "linear client leaves fallback retry timing to the scheduler when reset is unknown" do
     # Production logs show Linear returning RATELIMITED with an EMPTY headers
     # map; without a reset timestamp the retry must not fire immediately into
     # the same exhausted window.
@@ -602,10 +619,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                sleep_fun: fn ms -> send(parent, {:fallback_sleep, ms}) end
              )
 
-    assert_receive {:fallback_sleep, 60_000}
+    refute_receive {:fallback_sleep, _}
+    assert Orchestrator.retry_delay_for_test(1, %{error: {:rate_limited, nil}}) >= 300_000
   end
 
-  test "linear client delays non-critical requests by default when the rate-limit budget is low" do
+  test "linear client denies non-critical requests promptly when the rate-limit budget is low" do
     parent = self()
     reset_at = DateTime.utc_now() |> DateTime.add(2, :second)
 
@@ -619,15 +637,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       {:ok, %{status: 200, headers: %{}, body: %{"data" => %{}}}}
     end
 
-    # Reads default to non-critical: they wait out the low budget window.
-    assert {:ok, _} =
+    # Reads return a retryable denial; the scheduler owns its timer.
+    assert {:error, {:rate_limited, ^reset_at}} =
              Client.graphql("query Viewer { viewer { id } }", %{},
                request_fun: request_fun,
                sleep_fun: fn ms -> send(parent, {:budget_gate_sleep, ms}) end
              )
 
-    assert_receive {:budget_gate_sleep, gate_ms}
-    assert gate_ms > 0
+    refute_receive {:budget_gate_sleep, _}
 
     # Control-plane mutations pass critical?: true and bypass the gate.
     assert {:ok, _} =
@@ -879,6 +896,46 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              AgentRunner.continue_with_issue_for_test(stale_issue, fetcher)
   end
 
+  test "continuation stops when an implementing issue moves into review" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Ready for Agent", "Agent In Progress", "In Review", "Rework"]
+    )
+
+    implementing_issue = %Issue{
+      id: "role-transition-1",
+      identifier: "MT-1013",
+      title: "Implementation is done",
+      state: "Agent In Progress",
+      labels: ["symphony"]
+    }
+
+    review_issue = %Issue{implementing_issue | state: "In Review"}
+    fetcher = fn ["role-transition-1"] -> {:ok, [review_issue]} end
+
+    assert {:done, ^review_issue} =
+             AgentRunner.continue_with_issue_for_test(implementing_issue, fetcher)
+  end
+
+  test "continuation keeps normal implementation-state transitions in one worker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Ready for Agent", "Agent In Progress", "In Review", "Rework"]
+    )
+
+    ready_issue = %Issue{
+      id: "role-transition-2",
+      identifier: "MT-1014",
+      title: "Claimed work",
+      state: "Ready for Agent",
+      labels: ["symphony"]
+    }
+
+    claimed_issue = %Issue{ready_issue | state: "Agent In Progress"}
+    fetcher = fn ["role-transition-2"] -> {:ok, [claimed_issue]} end
+
+    assert {:continue, ^claimed_issue} =
+             AgentRunner.continue_with_issue_for_test(ready_issue, fetcher)
+  end
+
   test "dispatch and rework caps block issues with stuck label and comment" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -920,6 +977,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     dispatch_blocked_state =
       Orchestrator.dispatch_issue_for_test(dispatch_capped_issue, base_state)
+      |> await_dispatch_observation(dispatch_capped_issue.id)
 
     assert %{error: "symphony-stuck: max_dispatch_attempts=1" <> _} =
              dispatch_blocked_state.blocked[dispatch_capped_issue.id]
@@ -928,10 +986,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:memory_tracker_comment, "dispatch-cap-1", dispatch_comment}
     assert dispatch_comment =~ "max_dispatch_attempts=1"
 
-    SymphonyElixir.Ledger.put(rework_capped_issue.id, %{rework_count: 1})
+    SymphonyElixir.Ledger.put(rework_capped_issue.id, %{rework_count: 2})
 
     rework_blocked_state =
       Orchestrator.dispatch_issue_for_test(rework_capped_issue, base_state)
+      |> await_dispatch_observation(rework_capped_issue.id)
 
     assert %{error: "symphony-stuck: max_rework_cycles=1" <> _} =
              rework_blocked_state.blocked[rework_capped_issue.id]
@@ -939,6 +998,83 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:memory_tracker_label, "rework-cap-1", "symphony-stuck"}
     assert_receive {:memory_tracker_comment, "rework-cap-1", rework_comment}
     assert rework_comment =~ "max_rework_cycles=1"
+  end
+
+  test "rework issues are promoted back to Ready for Agent before dispatch until the rework cap is exceeded" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Ready for Agent", "Agent In Progress", "In Review", "Rework"],
+      max_dispatch_attempts: 10,
+      max_rework_cycles: 2
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{
+      id: "rework-loop-1",
+      identifier: "MT-1103",
+      title: "Needs another implementation pass",
+      state: "Rework"
+    }
+
+    assert {:ok, %Issue{state: "Ready for Agent"}} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert_receive {:memory_tracker_state_update, "rework-loop-1", "Ready for Agent"}
+    assert SymphonyElixir.Ledger.get("rework-loop-1").rework_count == 1
+
+    SymphonyElixir.Ledger.observe_state(issue.id, "In Review")
+
+    assert {:block, "symphony-stuck: max_rework_cycles=2" <> _} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    refute_receive {:memory_tracker_state_update, "rework-loop-1", "Ready for Agent"}
+    assert SymphonyElixir.Ledger.get("rework-loop-1").rework_count == 2
+  end
+
+  test "review failures routed directly to Ready for Agent are capped as rework cycles" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Ready for Agent", "Agent In Progress", "In Review"],
+      max_dispatch_attempts: 10,
+      max_rework_cycles: 2
+    )
+
+    issue = %Issue{
+      id: "ready-rework-loop-1",
+      identifier: "MT-1104",
+      title: "Review failed back to queue",
+      state: "Ready for Agent"
+    }
+
+    assert {:ok, %Issue{state: "Ready for Agent"}} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert Map.get(SymphonyElixir.Ledger.get(issue.id), :rework_count, 0) == 0
+
+    SymphonyElixir.Ledger.observe_state(issue.id, "Agent In Progress")
+    SymphonyElixir.Ledger.observe_state(issue.id, "In Review")
+
+    assert {:ok, %Issue{state: "Ready for Agent"}} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert SymphonyElixir.Ledger.get(issue.id).rework_count == 1
+
+    SymphonyElixir.Ledger.observe_state(issue.id, "Agent In Progress")
+    SymphonyElixir.Ledger.observe_state(issue.id, "In Review")
+
+    assert {:ok, %Issue{state: "Ready for Agent"}} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert SymphonyElixir.Ledger.get(issue.id).rework_count == 2
+
+    SymphonyElixir.Ledger.observe_state(issue.id, "Agent In Progress")
+    SymphonyElixir.Ledger.observe_state(issue.id, "In Review")
+
+    assert {:block, "symphony-stuck: max_rework_cycles=2" <> _} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert SymphonyElixir.Ledger.get(issue.id).rework_count == 3
   end
 
   test "dispatch cap reconciles rework history missed by polling before blocking" do
@@ -970,7 +1106,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert Map.get(SymphonyElixir.Ledger.get(rework_issue.id), :rework_count, 0) == 0
 
-    blocked_state = Orchestrator.dispatch_issue_for_test(rework_issue, base_state)
+    blocked_state = Orchestrator.dispatch_issue_for_test(rework_issue, base_state) |> await_dispatch_observation(rework_issue.id)
 
     assert %{error: "symphony-stuck: max_rework_cycles=3 reached after 3 rework cycles"} =
              blocked_state.blocked[rework_issue.id]
@@ -982,10 +1118,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert rework_comment =~ "max_rework_cycles=3"
   end
 
-  test "workspace remove returns error information for missing directory" do
+  test "workspace remove treats a missing directory inside the root as already removed" do
     random_path =
       Path.join(
-        System.tmp_dir!(),
+        Config.local_workspace_root(),
         "symphony-elixir-missing-#{System.unique_integer([:positive])}"
       )
 
@@ -1117,6 +1253,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "explicit approval policies are preserved instead of rewritten to the current default" do
+    policies = [
+      "never",
+      "on-request",
+      %{"reject" => %{"sandbox_approval" => true, "rules" => true, "mcp_elicitations" => true}},
+      %{"granular" => %{"sandbox_approval" => true, "rules" => false, "mcp_elicitations" => true}}
+    ]
+
+    for policy <- policies do
+      write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: policy)
+      assert Config.settings!().codex.approval_policy == policy
+      assert {:ok, runtime} = Config.codex_runtime_settings()
+      assert runtime.approval_policy == policy
+    end
+  end
+
   test "config reads defaults for optional settings" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
@@ -1145,10 +1297,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.command == "codex app-server"
 
     assert config.codex.approval_policy == %{
-             "reject" => %{
-               "sandbox_approval" => true,
-               "rules" => true,
-               "mcp_elicitations" => true
+             "granular" => %{
+               "sandbox_approval" => false,
+               "rules" => false,
+               "mcp_elicitations" => false,
+               "request_permissions" => false,
+               "skill_approval" => false
              }
            }
 
@@ -1168,6 +1322,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
+    assert config.codex.startup_timeout_ms == 60_000
     assert config.codex.stall_timeout_ms == 300_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -1227,6 +1382,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_read_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.read_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_startup_timeout_ms: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.startup_timeout_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -1342,14 +1501,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.workspace.root == "env:#{workspace_env_var}"
   end
 
-  test "config supports per-state max concurrent agent overrides" do
+  test "config supports per-state agent concurrency and turn overrides" do
     workflow = """
     ---
     agent:
       max_concurrent_agents: 10
+      max_turns: 20
       max_concurrent_agents_by_state:
         todo: 1
         "In Progress": 4
+        "In Review": 2
+      max_turns_by_state:
+        "Agent In Progress": 4
         "In Review": 2
     ---
     """
@@ -1362,6 +1525,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.max_concurrent_agents_for_state("In Review") == 2
     assert Config.max_concurrent_agents_for_state("Closed") == 10
     assert Config.max_concurrent_agents_for_state(:not_a_string) == 10
+    assert Config.max_turns_for_state("Agent In Progress", 20) == 4
+    assert Config.max_turns_for_state("In Review", 20) == 2
+    assert Config.max_turns_for_state("Closed", 20) == 20
+    assert Config.max_turns_for_state(:not_a_string, 20) == 20
 
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
     assert :ok = Config.validate!()
@@ -1767,6 +1934,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp await_dispatch_observation(state, issue_id) do
+    ref = state.issue_operations[issue_id].task.ref
+
+    receive do
+      {^ref, result} ->
+        {:noreply, state} = Orchestrator.handle_info({ref, result}, state)
+        state
+    after
+      1_000 -> flunk("dispatch refresh did not complete")
     end
   end
 end

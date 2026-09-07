@@ -1,0 +1,488 @@
+defmodule SymphonyElixir.OrchestratorAsyncRegressionTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.IssueStateBatcher
+  alias SymphonyElixir.Orchestrator.State
+
+  setup do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", max_concurrent_agents: 1)
+    :ok
+  end
+
+  test "a delayed poll leaves snapshots, token events and worker exits responsive and never installs its old state" do
+    parent = self()
+    name = unique_name()
+
+    fetcher = fn _cutoff ->
+      send(parent, {:poll_waiting, self()})
+
+      receive do
+        {:finish_poll, result} -> result
+      end
+    end
+
+    server = start_supervised!({Orchestrator, name: name, candidate_fetcher: fetcher})
+    assert_receive {:poll_waiting, poll_pid}, 1_000
+
+    worker =
+      spawn(fn ->
+        receive do
+          :finish -> :ok
+        end
+      end)
+
+    issue = issue("responsive")
+
+    :sys.replace_state(server, fn state ->
+      %{state | running: %{issue.id => running_entry(issue, worker)}, claimed: MapSet.new([issue.id])}
+    end)
+
+    usage = %{"tokenUsage" => %{"total" => %{"inputTokens" => 11, "outputTokens" => 3, "totalTokens" => 14}}}
+    update = %{event: :token_usage_updated, timestamp: DateTime.utc_now(), usage: usage}
+    send(server, {:codex_worker_update, issue.id, update})
+
+    snapshot = Orchestrator.snapshot(name, 200)
+    assert snapshot.codex_totals.total_tokens == 14
+    assert snapshot.polling.checking?
+
+    send(server, :run_poll_cycle)
+    send(server, :tick)
+    refute_receive {:poll_waiting, _}, 30
+    send(worker, :finish)
+    eventually(fn -> Map.has_key?(:sys.get_state(server).retry_attempts, issue.id) end)
+    assert Orchestrator.snapshot(name, 200).running == []
+
+    send(poll_pid, {:finish_poll, {:ok, []}})
+    eventually(fn -> is_nil(:sys.get_state(server).poll_task) end)
+    state = :sys.get_state(server)
+    assert state.codex_totals.total_tokens == 14
+    assert state.running == %{}
+    assert Map.has_key?(state.retry_attempts, issue.id)
+    assert MapSet.member?(state.claimed, issue.id)
+  end
+
+  test "a stale reconciliation cannot stop a replacement worker or overwrite its token totals" do
+    issue = issue("generation")
+    old_ref = make_ref()
+    new_ref = make_ref()
+    poll_ref = make_ref()
+    timer = Process.send_after(self(), :unused, 60_000)
+    entry = %{running_entry(issue, nil) | ref: new_ref, codex_total_tokens: 42}
+    poll = %{task: %{ref: poll_ref}, timer: timer, running_refs: %{issue.id => old_ref}, blocked_refs: %{}, retention_ids: [], started_at: DateTime.utc_now(), full?: true, force_full?: true}
+    state = %State{running: %{issue.id => entry}, claimed: MapSet.new([issue.id]), poll_task: poll, poll_interval_ms: 30_000, max_concurrent_agents: 1, codex_totals: totals(42)}
+
+    {:noreply, result} =
+      Orchestrator.handle_info(
+        {poll_ref, %{running: {:ok, [%{issue | state: "Done"}]}, blocked: {:ok, []}, candidates: {:ok, []}}},
+        state
+      )
+
+    assert result.running[issue.id].ref == new_ref
+    assert result.running[issue.id].codex_total_tokens == 42
+    assert result.codex_totals.total_tokens == 42
+    Process.cancel_timer(result.tick_timer_ref)
+  end
+
+  test "missing and ineligible final retry refreshes release their claim" do
+    for result <- [{:ok, []}, {:ok, [%{issue("retry") | state: "Human Review"}]}] do
+      issue = issue("retry")
+      state = dispatch_state(issue, fn _ -> result end)
+      pending = Orchestrator.dispatch_issue_for_test(issue, state)
+      assert MapSet.member?(pending.claimed, issue.id)
+      assert map_size(pending.issue_operations) == 1
+      {ref, observation} = receive_observation(pending, issue.id)
+      {:noreply, finished} = Orchestrator.handle_info({ref, observation}, pending)
+      refute MapSet.member?(finished.claimed, issue.id)
+      assert finished.retry_attempts == %{}
+      assert finished.issue_operations == %{}
+    end
+  end
+
+  test "transient final refresh errors reschedule instead of stranding retry claims" do
+    issue = issue("retry-error")
+    state = dispatch_state(issue, fn _ -> {:error, {:rate_limited, nil}} end)
+    pending = Orchestrator.dispatch_issue_for_test(issue, state)
+    {ref, observation} = receive_observation(pending, issue.id)
+    {:noreply, finished} = Orchestrator.handle_info({ref, observation}, pending)
+    assert MapSet.member?(finished.claimed, issue.id)
+    assert finished.retry_attempts[issue.id].error == {:rate_limited, nil}
+    assert finished.retry_attempts[issue.id].due_at_ms - System.monotonic_time(:millisecond) > 250_000
+    Process.cancel_timer(finished.retry_attempts[issue.id].timer_ref)
+  end
+
+  test "dispatch reserves capacity before its final tracker read finishes" do
+    parent = self()
+    first = issue("first")
+
+    fetcher = fn _ ->
+      send(parent, {:dispatch_waiting, self()})
+
+      receive do
+        :finish -> {:ok, []}
+      end
+    end
+
+    pending = Orchestrator.dispatch_issue_for_test(first, dispatch_state(first, fetcher))
+    assert_receive {:dispatch_waiting, pid}
+    refute Orchestrator.should_dispatch_issue_for_test(issue("second"), pending)
+    assert pending.running == %{}
+    assert MapSet.member?(pending.claimed, first.id)
+    send(pid, :finish)
+    {ref, result} = receive_observation(pending, first.id)
+    assert {:noreply, _} = Orchestrator.handle_info({ref, result}, pending)
+  end
+
+  test "slot queue dispatch releases a stale claim and continues to the next queued entry" do
+    first = issue("queue-first")
+    second = issue("queue-second")
+    queue = Enum.map([first, second], fn issue -> %{issue_id: issue.id, issue: issue, attempt: 2, metadata: %{identifier: issue.identifier}} end)
+
+    state = %State{
+      slot_queue: queue,
+      claimed: MapSet.new([first.id, second.id]),
+      max_concurrent_agents: 1,
+      poll_interval_ms: 30_000,
+      issue_fetcher: fn _ -> {:ok, []} end,
+      candidate_fetcher: fn _ -> {:ok, []} end
+    }
+
+    {:noreply, pending} = Orchestrator.handle_info(:run_poll_cycle, state)
+    {ref, result} = receive_observation(pending, first.id)
+    {:noreply, next} = Orchestrator.handle_info({ref, result}, pending)
+    refute MapSet.member?(next.claimed, first.id)
+    assert Map.has_key?(next.issue_operations, second.id)
+    {second_ref, result} = receive_observation(next, second.id)
+    {:noreply, done} = Orchestrator.handle_info({second_ref, result}, next)
+    refute MapSet.member?(done.claimed, second.id)
+    assert done.slot_queue == []
+    Process.exit(done.poll_task.task.pid, :kill)
+    Process.cancel_timer(done.poll_task.timer)
+  end
+
+  test "batcher accepts new callers during a delayed fetch and keeps only one batch in flight" do
+    parent = self()
+    name = unique_name()
+
+    fetcher = fn ids ->
+      send(parent, {:batch_waiting, self(), ids})
+
+      receive do
+        :finish -> {:ok, Enum.map(ids, &%{id: &1})}
+      end
+    end
+
+    batcher = start_supervised!({IssueStateBatcher, name: name, fetcher: fetcher, batch_delay_ms: 1})
+    first = Task.async(fn -> GenServer.call(batcher, {:fetch, ["one"]}) end)
+    assert_receive {:batch_waiting, first_pid, ["one"]}
+    second = Task.async(fn -> GenServer.call(batcher, {:fetch, ["two"]}) end)
+    eventually(fn -> map_size(:sys.get_state(batcher).pending) == 1 end)
+    assert :sys.get_state(batcher, 200).in_flight.task.pid == first_pid
+    refute_receive {:batch_waiting, _, ["two"]}, 30
+    send(first_pid, :finish)
+    assert {:ok, [%{id: "one"}]} = Task.await(first)
+    assert_receive {:batch_waiting, second_pid, ["two"]}
+    send(second_pid, :finish)
+    assert {:ok, [%{id: "two"}]} = Task.await(second)
+  end
+
+  test "Linear quota denial returns promptly without sleeping or issuing a request" do
+    alias SymphonyElixir.Linear.RateLimitBudget
+    reset_at = DateTime.add(DateTime.utc_now(), 600)
+    RateLimitBudget.update_from_headers(%{"x-ratelimit-requests-remaining" => "0", "x-ratelimit-requests-reset" => DateTime.to_iso8601(reset_at)})
+    parent = self()
+    on_exit(fn -> RateLimitBudget.update_from_headers(%{"x-ratelimit-requests-remaining" => "1000"}) end)
+
+    task =
+      Task.async(fn ->
+        Client.graphql("query { viewer { id } }", %{},
+          request_fun: fn _, _ -> send(parent, :unexpected_request) end,
+          sleep_fun: fn _ -> send(parent, :unexpected_sleep) end
+        )
+      end)
+
+    assert {:error, {:rate_limited, ^reset_at}} = Task.await(task, 200)
+    refute_receive :unexpected_request
+    refute_receive :unexpected_sleep
+  end
+
+  test "terminal cleanup waits for worker exit and uses its captured path after a root change" do
+    parent = self()
+    root = Path.join(System.tmp_dir!(), "symphony-cleanup-#{System.unique_integer([:positive])}")
+    old_root = Path.join(root, "old")
+    new_root = Path.join(root, "new")
+    issue = issue("cleanup")
+    workspace = Path.join(old_root, issue.identifier)
+    other_workspace = Path.join(new_root, issue.identifier)
+    alive_marker = Path.join(root, "worker-alive")
+    unsafe_marker = Path.join(root, "cleanup-before-worker-exit")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(other_workspace)
+    File.write!(Path.join(other_workspace, "precious"), "preserve")
+    File.write!(alive_marker, "alive")
+
+    for args <- [
+          ["init", "-b", "main"],
+          ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base"],
+          ["update-ref", "refs/remotes/origin/staging", "HEAD"]
+        ] do
+      assert {_output, 0} = System.cmd("git", ["-C", workspace | args], stderr_to_stdout: true)
+    end
+
+    on_exit(fn -> File.rm_rf(root) end)
+    hook = "if [ -e '#{alive_marker}' ]; then touch '#{unsafe_marker}'; fi"
+    workflow_opts = [tracker_kind: "memory", workspace_root: new_root, hook_before_remove: hook]
+    write_workflow_file!(Workflow.workflow_file_path(), workflow_opts)
+
+    worker =
+      spawn(fn ->
+        Process.flag(:trap_exit, true)
+        send(parent, {:worker_ready, self()})
+
+        receive do
+          {:EXIT, _sender, :shutdown} ->
+            send(parent, :worker_stopping)
+
+            receive do
+              :allow_exit -> File.rm!(alive_marker)
+            end
+        end
+      end)
+
+    on_exit(fn -> Process.exit(worker, :kill) end)
+    assert_receive {:worker_ready, ^worker}
+    name = unique_name()
+    issue_fetcher = fn _ -> {:ok, [%{issue | state: "Done"}]} end
+    opts = [name: name, candidate_fetcher: fn _ -> {:ok, []} end, issue_fetcher: issue_fetcher]
+    server = start_supervised!({Orchestrator, opts})
+
+    :sys.replace_state(server, fn state ->
+      entry = Map.merge(running_entry(issue, worker), %{workspace_path: workspace, workspace_root: old_root, cleanup_base_ref: "refs/remotes/origin/staging"})
+      %{state | running: %{issue.id => entry}, claimed: MapSet.new([issue.id])}
+    end)
+
+    send(server, :run_poll_cycle)
+    assert_receive :worker_stopping, 1_000
+    assert File.dir?(workspace)
+    assert MapSet.member?(:sys.get_state(server).claimed, issue.id)
+    assert Orchestrator.snapshot(name, 200).running == []
+    send(worker, :allow_exit)
+    eventually(fn -> not MapSet.member?(:sys.get_state(server).claimed, issue.id) end)
+    refute Process.alive?(worker)
+    refute File.exists?(workspace)
+    refute File.exists?(unsafe_marker)
+    assert File.read!(Path.join(other_workspace, "precious")) == "preserve"
+  end
+
+  test "an exhausted budget without reset headers eventually allows one recovery probe" do
+    alias SymphonyElixir.Linear.RateLimitBudget
+    RateLimitBudget.update_from_headers(%{"x-ratelimit-requests-remaining" => "0"})
+    on_exit(fn -> RateLimitBudget.update_from_headers(%{"x-ratelimit-requests-remaining" => "1000"}) end)
+    assert {:error, {:rate_limited, nil}} = RateLimitBudget.acquire_read()
+    Agent.update(RateLimitBudget, &%{&1 | updated_at: DateTime.add(DateTime.utc_now(), -61, :second)})
+    assert :ok = RateLimitBudget.acquire_read()
+    assert {:error, {:rate_limited, %DateTime{}}} = RateLimitBudget.acquire_read()
+  end
+
+  test "a malformed batch result fails callers without crashing the batcher" do
+    name = unique_name()
+    fetcher = fn _ -> {:ok, [:malformed]} end
+    batcher = start_supervised!({IssueStateBatcher, name: name, fetcher: fetcher, batch_delay_ms: 1})
+    assert {:error, :invalid_issue_state_result} = GenServer.call(batcher, {:fetch, ["issue"]})
+    assert Process.alive?(batcher)
+  end
+
+  test "batch task failure replies to waiters and permits the next batch" do
+    parent = self()
+
+    fetcher = fn ids ->
+      send(parent, {:fetch_started, self(), ids})
+
+      receive do
+        :crash -> exit(:controlled_failure)
+        :finish -> {:ok, Enum.map(ids, &%{id: &1})}
+      end
+    end
+
+    batcher = start_supervised!({IssueStateBatcher, name: unique_name(), fetcher: fetcher, batch_delay_ms: 1})
+    first = Task.async(fn -> GenServer.call(batcher, {:fetch, ["first"]}) end)
+    assert_receive {:fetch_started, fetch_pid, ["first"]}
+    second = Task.async(fn -> GenServer.call(batcher, {:fetch, ["second"]}) end)
+    eventually(fn -> map_size(:sys.get_state(batcher).pending) == 1 end)
+    send(fetch_pid, :crash)
+    assert {:error, {:issue_state_batch_failed, :controlled_failure}} = Task.await(first)
+    assert_receive {:fetch_started, next_pid, ["second"]}
+    send(next_pid, :finish)
+    assert {:ok, [%{id: "second"}]} = Task.await(second)
+    assert Process.alive?(batcher)
+  end
+
+  test "batch timeout terminates its fetch and answers the waiting caller" do
+    parent = self()
+
+    fetcher = fn _ ->
+      send(parent, {:fetch_started, self()})
+
+      receive do
+        :finish -> {:ok, []}
+      end
+    end
+
+    batcher = start_supervised!({IssueStateBatcher, name: unique_name(), fetcher: fetcher, batch_delay_ms: 1})
+    caller = Task.async(fn -> GenServer.call(batcher, {:fetch, ["waiting"]}) end)
+    assert_receive {:fetch_started, fetch_pid}
+    monitor = Process.monitor(fetch_pid)
+    ref = :sys.get_state(batcher).in_flight.task.ref
+    send(batcher, {:batch_timeout, ref})
+    assert {:error, :issue_state_batch_timeout} = Task.await(caller)
+    assert_receive {:DOWN, ^monitor, :process, ^fetch_pid, :killed}
+    assert :sys.get_state(batcher).in_flight == nil
+    assert Process.alive?(batcher)
+  end
+
+  test "non-list batch results are structured errors and empty IDs never fetch" do
+    parent = self()
+    name = unique_name()
+
+    fetcher = fn ids ->
+      send(parent, {:fetched, ids})
+      {:ok, :malformed}
+    end
+
+    batcher = start_supervised!({IssueStateBatcher, name: name, fetcher: fetcher, batch_delay_ms: 1})
+    assert {:ok, []} = IssueStateBatcher.fetch_issue_states_by_ids([], server: name)
+    assert :sys.get_state(batcher).pending == %{}
+    refute_receive {:fetched, _}, 10
+    assert {:error, {:invalid_issue_state_result, {:ok, :malformed}}} = GenServer.call(batcher, {:fetch, ["bad"]})
+    assert_receive {:fetched, ["bad"]}
+    assert Process.alive?(batcher)
+  end
+
+  test "Studio review failures routed back to Todo enforce the rework cap" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", max_rework_cycles: 1)
+    issue = %{issue("todo-rework") | state: "Todo"}
+    SymphonyElixir.Ledger.observe_state(issue.id, "In Review")
+    assert {:ok, _} = Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+    SymphonyElixir.Ledger.observe_state(issue.id, "In Review")
+
+    assert {:block, "symphony-stuck: max_rework_cycles=1" <> _} =
+             Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+
+    assert SymphonyElixir.Ledger.get(issue.id).rework_count == 2
+  end
+
+  test "stopping workers reserve capacity until termination is confirmed" do
+    issue = issue("stopping")
+
+    worker =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> Process.exit(worker, :kill) end)
+    entry = running_entry(issue, worker)
+    operation = %{kind: :cleanup, entry: entry}
+    state = %State{max_concurrent_agents: 1, issue_operations: %{issue.id => operation}}
+    refute Orchestrator.should_dispatch_issue_for_test(issue("new"), state)
+    blocked = %State{max_concurrent_agents: 1, blocked: %{issue.id => entry}}
+    refute Orchestrator.should_dispatch_issue_for_test(issue("new"), blocked)
+  end
+
+  test "missing blocked issues retain ownership until a previously unconfirmed worker stops" do
+    parent = self()
+
+    worker =
+      spawn(fn ->
+        Process.flag(:trap_exit, true)
+        send(parent, :blocked_worker_ready)
+
+        receive do
+          {:EXIT, _sender, :shutdown} ->
+            send(parent, :blocked_worker_stopping)
+
+            receive do
+              :finish -> :ok
+            end
+        end
+      end)
+
+    on_exit(fn -> Process.exit(worker, :kill) end)
+    assert_receive :blocked_worker_ready
+    issue = issue("blocked-stop")
+    entry = Map.merge(running_entry(issue, worker), %{blocked_at: DateTime.utc_now(), error: "stop unconfirmed"})
+    poll_ref = make_ref()
+    timer = Process.send_after(self(), :unused, 60_000)
+    poll = %{task: %{ref: poll_ref}, timer: timer, running_refs: %{}, blocked_refs: %{issue.id => entry.blocked_at}, retention_ids: [], started_at: DateTime.utc_now(), full?: true, force_full?: true}
+    state = %State{blocked: %{issue.id => entry}, claimed: MapSet.new([issue.id]), poll_task: poll, poll_interval_ms: 30_000, max_concurrent_agents: 1, codex_totals: totals(0)}
+
+    {:noreply, stopping} =
+      Orchestrator.handle_info(
+        {poll_ref, %{running: {:ok, []}, blocked: {:ok, []}, candidates: {:ok, []}}},
+        state
+      )
+
+    assert_receive :blocked_worker_stopping
+    assert MapSet.member?(stopping.claimed, issue.id)
+    refute Orchestrator.should_dispatch_issue_for_test(issue("new"), stopping)
+    send(worker, :finish)
+    {ref, result} = receive_observation(stopping, issue.id)
+    {:noreply, stopped} = Orchestrator.handle_info({ref, result}, stopping)
+    refute MapSet.member?(stopped.claimed, issue.id)
+    refute Process.alive?(worker)
+    Process.cancel_timer(stopped.tick_timer_ref)
+  end
+
+  defp receive_observation(state, id) do
+    ref = state.issue_operations[id].task.ref
+
+    receive do
+      {^ref, result} -> {ref, result}
+    after
+      1_000 -> flunk("operation did not finish")
+    end
+  end
+
+  defp dispatch_state(issue, fetcher) do
+    %State{claimed: MapSet.new([issue.id]), issue_fetcher: fetcher, max_concurrent_agents: 1, poll_interval_ms: 30_000, codex_totals: totals(0)}
+  end
+
+  defp running_entry(issue, worker) do
+    %{
+      pid: worker,
+      ref: if(is_pid(worker), do: Process.monitor(worker), else: make_ref()),
+      issue: issue,
+      identifier: issue.identifier,
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil,
+      session_id: nil,
+      started_at: DateTime.utc_now(),
+      retry_attempt: 0,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      last_codex_message: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      turn_count: 0
+    }
+  end
+
+  defp totals(total), do: %{input_tokens: total, output_tokens: 0, cached_input_tokens: 0, total_tokens: total, effective_total_tokens: total, seconds_running: 0}
+  defp issue(id), do: %Issue{id: id, identifier: "SPK-#{id}", title: id, state: "Todo", priority: 1, blocked_by: [], labels: []}
+  defp unique_name, do: String.to_atom("async_regression_#{System.unique_integer([:positive])}")
+  defp eventually(fun, attempts \\ 100)
+  defp eventually(_fun, 0), do: flunk("condition did not become true")
+
+  defp eventually(fun, attempts) do
+    if fun.(),
+      do: :ok,
+      else:
+        (receive do
+         after
+           5 -> eventually(fun, attempts - 1)
+         end)
+  end
+end

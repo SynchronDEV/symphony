@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Ledger do
   Small persistent per-issue ledger for orchestrator counters.
   """
 
-  use Agent
+  use GenServer
   require Logger
 
   @known_keys %{
@@ -23,28 +23,38 @@ defmodule SymphonyElixir.Ledger do
     "rework_count" => :rework_count,
     "retries" => :retries,
     "stall_events" => :stall_events,
+    "last_observed_state" => :last_observed_state,
     "state" => :state,
     "terminal_at" => :terminal_at,
     "turns_used" => :turns_used,
-    "worker_host" => :worker_host
+    "worker_host" => :worker_host,
+    "workspace_path" => :workspace_path,
+    "workspace_root" => :workspace_root,
+    "cleanup_base_ref" => :cleanup_base_ref,
+    "eligible" => :eligible,
+    "issue_id" => :issue_id,
+    "completed_at" => :completed_at,
+    "status" => :status,
+    "merged_into" => :merged_into,
+    "wall_time" => :wall_time
   }
 
   @type issue_id :: String.t()
   @type issue_entry :: map()
 
-  @spec start_link(keyword()) :: Agent.on_start()
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    Agent.start_link(fn -> load(path(opts)) end, name: Keyword.get(opts, :name, __MODULE__))
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @spec get(issue_id()) :: issue_entry()
   def get(issue_id) when is_binary(issue_id) do
-    Agent.get(__MODULE__, &Map.get(&1.entries, issue_id, %{}))
+    GenServer.call(__MODULE__, {:get, issue_id})
   end
 
   @spec all() :: map()
   def all do
-    Agent.get(__MODULE__, & &1.entries)
+    GenServer.call(__MODULE__, :all)
   end
 
   @spec increment(issue_id(), atom(), integer()) :: issue_entry()
@@ -66,10 +76,10 @@ defmodule SymphonyElixir.Ledger do
     total = Map.get(token_delta, :total_tokens, 0)
     cached_input = Map.get(token_delta, :cached_input_tokens, 0)
 
-    # Budget measures real spend: cached prompt-prefix reads are reported
-    # inside the totals but cost ~0, so subtract them. Payloads without a
-    # cached field yield cached_input 0 and the previous raw-total behavior.
-    increment(issue_id, :cumulative_tokens, max(total - cached_input, 0))
+    # Preserve the fork's effective-token accounting. This is a token metric,
+    # not a currency calculation: cached tokens are excluded from this cap.
+    amount = max(total - cached_input, 0)
+    GenServer.call(__MODULE__, {:tokens, issue_id, amount})
   end
 
   @spec put(issue_id(), map()) :: issue_entry()
@@ -103,25 +113,76 @@ defmodule SymphonyElixir.Ledger do
 
   @spec update(issue_id(), (issue_entry() -> issue_entry())) :: issue_entry()
   def update(issue_id, fun) when is_binary(issue_id) and is_function(fun, 1) do
-    Agent.get_and_update(__MODULE__, fn %{entries: entries, path: path} = state ->
-      entry =
-        entries
-        |> Map.get(issue_id, %{})
-        |> fun.()
-        |> normalize_entry()
-
-      entries = Map.put(entries, issue_id, entry)
-      persist(path, entries)
-      {entry, %{state | entries: entries}}
-    end)
+    GenServer.call(__MODULE__, {:update, issue_id, fun})
   end
 
   @spec reset!() :: :ok
   def reset! do
-    Agent.update(__MODULE__, fn %{path: path} = state ->
-      persist(path, %{})
-      %{state | entries: %{}}
-    end)
+    GenServer.call(__MODULE__, :reset)
+  end
+
+  @spec flush() :: :ok
+  def flush, do: GenServer.call(__MODULE__, :flush)
+
+  @spec info() :: map()
+  def info, do: GenServer.call(__MODULE__, :info)
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    ledger_path = path(opts)
+
+    with {:ok, canonical_path} <- SymphonyElixir.PathSafety.canonicalize(ledger_path),
+         :ok <- File.mkdir_p(Path.dirname(canonical_path)),
+         {:ok, lock} <- acquire_lock(canonical_path, Keyword.get(opts, :lock_writer, &:file.write/2)) do
+      case load(canonical_path) do
+        {:ok, entries} ->
+          {:ok, %{path: canonical_path, entries: entries, lock: lock, dirty: false, timer: nil, flush_interval_ms: Keyword.get(opts, :flush_interval_ms, 250), writes: 0}}
+
+        {:error, reason} ->
+          release_lock(lock)
+          {:stop, reason}
+      end
+    else
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  @impl true
+  def handle_call({:get, issue_id}, _from, state), do: {:reply, Map.get(state.entries, issue_id, %{}), state}
+  def handle_call(:all, _from, state), do: {:reply, state.entries, state}
+  def handle_call(:info, _from, state), do: {:reply, Map.take(state, [:path, :dirty, :writes]), state}
+
+  def handle_call({:tokens, issue_id, 0}, _from, state),
+    do: {:reply, Map.get(state.entries, issue_id, %{}), state}
+
+  def handle_call({:tokens, issue_id, amount}, _from, state) do
+    entry = Map.update(Map.get(state.entries, issue_id, %{}), :cumulative_tokens, amount, &increment_value(&1, amount))
+    state = %{state | entries: Map.put(state.entries, issue_id, entry), dirty: true}
+    timer = state.timer || Process.send_after(self(), :flush, state.flush_interval_ms)
+    {:reply, entry, %{state | timer: timer}}
+  end
+
+  def handle_call({:update, issue_id, fun}, _from, state) do
+    entry = state.entries |> Map.get(issue_id, %{}) |> fun.() |> normalize_entry()
+    entries = Map.put(state.entries, issue_id, entry)
+    state = %{state | entries: entries, dirty: state.dirty or entries != state.entries}
+    {:reply, entry, persist_pending!(state)}
+  end
+
+  def handle_call(:reset, _from, state),
+    do: {:reply, :ok, persist_pending!(%{state | entries: %{}, dirty: true})}
+
+  def handle_call(:flush, _from, state), do: {:reply, :ok, persist_pending!(state)}
+
+  @impl true
+  def handle_info(:flush, state), do: {:noreply, persist_pending!(%{state | timer: nil})}
+
+  @impl true
+  def terminate(_reason, state) do
+    persist_pending!(state)
+  after
+    release_lock(state.lock)
   end
 
   # Edge-triggered rework counter shared by EVERY place an issue state is
@@ -130,28 +191,47 @@ defmodule SymphonyElixir.Ledger do
   # implement -> review -> rework cycle can happen inside one continuous
   # agent run with zero dispatches (observed live: SYNC-705 ran 4 rework
   # cycles in one session), so the max_rework_cycles cap never fired.
+  #
+  # Newer workflows route review failures straight back to Ready for Agent
+  # instead of the legacy Rework state. Count that In Review -> Ready for Agent
+  # transition as the same kind of cycle, while leaving initial Backlog -> Ready
+  # promotion uncounted.
   @spec observe_state(issue_id(), String.t() | nil) :: issue_entry()
   def observe_state(issue_id, state) when is_binary(issue_id) do
-    in_rework? = rework_state?(state)
+    normalized_state = normalize_state(state)
+    in_rework? = normalized_state == "rework"
 
     update(issue_id, fn entry ->
+      last_observed_state = Map.get(entry, :last_observed_state)
+      review_failed_to_ready? = last_observed_state == "in review" and normalized_state in ["ready for agent", "todo"]
+
       entry =
-        if in_rework? and Map.get(entry, :last_rework_state) != true do
+        if (in_rework? and Map.get(entry, :last_rework_state) != true) or review_failed_to_ready? do
           Map.update(entry, :rework_count, 1, &(&1 + 1))
         else
           entry
         end
 
-      Map.put(entry, :last_rework_state, in_rework?)
+      entry
+      |> Map.put(:last_rework_state, in_rework?)
+      |> Map.put(:last_observed_state, normalized_state)
     end)
   end
 
   @spec rework_state?(String.t() | nil) :: boolean()
   def rework_state?(state) when is_binary(state) do
-    state |> String.trim() |> String.downcase() == "rework"
+    normalize_state(state) == "rework"
   end
 
   def rework_state?(_state), do: false
+
+  defp normalize_state(state) when is_binary(state) do
+    state
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_state(_state), do: nil
 
   @spec record_terminal(issue_id(), map()) :: issue_entry()
   def record_terminal(issue_id, attrs) when is_binary(issue_id) and is_map(attrs) do
@@ -176,92 +256,143 @@ defmodule SymphonyElixir.Ledger do
 
   defp default_path do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
-      Path.join(System.tmp_dir!(), "symphony_elixir_test_ledger.json")
+      Path.join(System.tmp_dir!(), "symphony_elixir_test_ledger-#{System.pid()}.json")
     else
-      Path.join(deployment_dir(), ".symphony/ledger.json")
+      path_for_workflow(SymphonyElixir.Workflow.workflow_file_path())
     end
   end
 
-  # The ledger belongs to the deployment it describes — the directory the
-  # WORKFLOW.md lives in — NOT the BEAM's cwd. Launchers commonly `cd` to the
-  # Symphony install dir before exec (the escript wrapper does), which would
-  # put the ledger in the install dir and silently SHARE it between
-  # deployments. Same cwd-assumption family as the mirror-source bug.
-  defp deployment_dir do
-    case SymphonyElixir.Workflow.workflow_file_path() do
-      path when is_binary(path) and path != "" ->
-        dir = path |> Path.expand() |> Path.dirname()
-        if File.dir?(dir), do: dir, else: File.cwd!()
-
-      _ ->
-        File.cwd!()
-    end
+  @spec path_for_workflow(Path.t()) :: Path.t()
+  def path_for_workflow(workflow) when is_binary(workflow) do
+    {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(workflow)
+    stem = canonical |> Path.basename() |> Path.rootname() |> String.replace(~r/[^a-zA-Z0-9._-]/, "_")
+    hash = :crypto.hash(:sha256, canonical) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+    Path.join([Path.dirname(canonical), ".symphony", "#{stem}-#{hash}", "ledger.json"])
   end
 
   defp load(path) do
-    maybe_migrate_legacy(path)
-
-    entries =
-      case File.read(path) do
-        {:ok, body} ->
-          decode_entries(body)
-
-        {:error, :enoent} ->
-          %{}
-
-        {:error, reason} ->
-          Logger.warning("Unable to read Symphony ledger #{path}: #{inspect(reason)}")
-          %{}
-      end
-
-    %{path: path, entries: entries}
+    # Legacy shared ledgers need an explicit, scoped migration. Never import
+    # another deployment's counters merely because it used this working directory.
+    case File.read(path) do
+      {:ok, body} -> decode_entries(body)
+      {:error, :enoent} -> {:ok, %{}}
+      {:error, reason} -> {:error, {:ledger_read_failed, path, reason}}
+    end
   end
 
   @doc false
-  @spec maybe_migrate_legacy(Path.t(), Path.t() | nil) :: :ok
+  @spec maybe_migrate_legacy(Path.t(), Path.t() | nil) :: :ok | {:error, term()}
   def maybe_migrate_legacy(path, legacy_path \\ nil) do
-    legacy = legacy_path || Path.join(File.cwd!(), ".symphony/ledger.json")
+    if is_nil(legacy_path), do: :ok, else: migrate_legacy(path, legacy_path)
+  end
 
-    if legacy != path and not File.exists?(path) and File.exists?(legacy) do
-      File.mkdir_p!(Path.dirname(path))
-
-      case File.cp(legacy, path) do
-        :ok ->
-          Logger.info("Migrated Symphony ledger from legacy cwd location #{legacy} to #{path}")
-
-        {:error, reason} ->
-          Logger.warning("Failed to migrate legacy Symphony ledger #{legacy} -> #{path}: #{inspect(reason)}")
+  defp migrate_legacy(path, legacy) when is_binary(legacy) do
+    with {:ok, canonical} <- SymphonyElixir.PathSafety.canonicalize(path),
+         :ok <- File.mkdir_p(Path.dirname(canonical)),
+         {:ok, lock} <- acquire_lock(canonical) do
+      try do
+        if File.exists?(canonical) or not File.exists?(legacy) do
+          :ok
+        else
+          with {:ok, body} <- File.read(legacy),
+               {:ok, entries} <- decode_entries(body) do
+            persist!(canonical, entries)
+            :ok
+          end
+        end
+      after
+        release_lock(lock)
       end
     end
-
-    :ok
   end
 
   defp decode_entries(body) when is_binary(body) do
     case Jason.decode(body) do
       {:ok, decoded} when is_map(decoded) ->
-        Map.new(decoded, fn {issue_id, entry} -> {issue_id, normalize_entry(entry)} end)
+        if Enum.all?(decoded, &valid_entry?/1) do
+          {:ok, Map.new(decoded, fn {issue_id, entry} -> {issue_id, normalize_entry(entry)} end)}
+        else
+          {:error, {:invalid_ledger, :invalid_json_or_shape}}
+        end
 
       _ ->
-        %{}
+        {:error, {:invalid_ledger, :invalid_json_or_shape}}
     end
   end
 
-  defp persist(path, entries) when is_binary(path) and is_map(entries) do
+  defp valid_entry?({id, entry}), do: is_binary(id) and is_map(entry) and valid_counters?(entry)
+
+  defp valid_counters?(entry) do
+    Enum.all?(["cumulative_tokens", "dispatch_count", "rework_count", "retries", "stall_events", "turns_used"], fn key ->
+      case Map.fetch(entry, key) do
+        :error -> true
+        {:ok, value} -> is_integer(value) and value >= 0
+      end
+    end)
+  end
+
+  defp persist_pending!(%{dirty: false} = state), do: state
+
+  defp persist_pending!(state) do
+    if state.timer, do: Process.cancel_timer(state.timer)
+    persist!(state.path, state.entries)
+    %{state | dirty: false, timer: nil, writes: state.writes + 1}
+  end
+
+  defp persist!(path, entries) when is_binary(path) and is_map(entries) do
     encoded =
       entries
       |> Map.new(fn {issue_id, entry} -> {issue_id, stringify_entry(entry)} end)
       |> Jason.encode!()
 
-    path
-    |> Path.dirname()
-    |> File.mkdir_p!()
+    temporary = path <> ".tmp-#{System.pid()}-#{System.unique_integer([:positive])}"
 
-    File.write!(path, encoded)
-  rescue
-    exception ->
-      Logger.warning("Unable to persist Symphony ledger #{path}: #{Exception.message(exception)}")
-      :ok
+    try do
+      {:ok, file} = File.open(temporary, [:write, :binary, :exclusive])
+
+      try do
+        :ok = IO.binwrite(file, encoded)
+        :ok = :file.sync(file)
+      after
+        File.close(file)
+      end
+
+      File.rename!(temporary, path)
+    after
+      File.rm(temporary)
+    end
+  end
+
+  # The writer seam permits deterministic disk-failure checks after exclusive open.
+  # Normal startup and migration both use the filesystem writer.
+  defp acquire_lock(path, writer \\ &:file.write/2) do
+    lock_path = path <> ".lock"
+    owner = "#{System.pid()}:#{System.unique_integer([:positive])}"
+
+    case File.open(lock_path, [:write, :exclusive]) do
+      {:ok, file} ->
+        case writer.(file, owner) do
+          :ok ->
+            File.close(file)
+            {:ok, {lock_path, owner}}
+
+          {:error, reason} ->
+            File.close(file)
+            File.rm(lock_path)
+            {:error, {:ledger_lock_failed, lock_path, reason}}
+        end
+
+      {:error, :eexist} ->
+        {:error, {:ledger_locked, lock_path}}
+
+      {:error, reason} ->
+        {:error, {:ledger_lock_failed, lock_path, reason}}
+    end
+  end
+
+  defp release_lock({path, owner}) do
+    if File.read(path) == {:ok, owner}, do: File.rm(path)
+    :ok
   end
 
   defp emit_metrics_line(issue_id, entry) do
@@ -293,9 +424,9 @@ defmodule SymphonyElixir.Ledger do
   defp metrics_path do
     Application.get_env(:symphony_elixir, :metrics_ledger_path) ||
       if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
-        Path.join(System.tmp_dir!(), "symphony_elixir_test_metrics.jsonl")
+        Path.join(System.tmp_dir!(), "symphony_elixir_test_metrics-#{System.pid()}.jsonl")
       else
-        Path.join(File.cwd!(), ".symphony/metrics.jsonl")
+        Path.join(Path.dirname(info().path), "metrics.jsonl")
       end
   end
 

@@ -24,7 +24,7 @@ defmodule SymphonyElixirWeb.Presenter do
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           claim_leases: Enum.map(Map.get(snapshot, :claim_leases, []), &claim_lease_payload/1),
           expired: Enum.map(Map.get(snapshot, :expired, []), &expired_claim_payload/1),
-          codex_totals: snapshot.codex_totals,
+          codex_totals: codex_totals_payload(snapshot.codex_totals),
           token_usage: TokenUsageLedger.summary(),
           rate_limits: snapshot.rate_limits
         }
@@ -130,8 +130,10 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
+        cached_input_tokens: Map.get(entry, :codex_cached_input_tokens, 0),
         output_tokens: entry.codex_output_tokens,
-        total_tokens: entry.codex_total_tokens
+        total_tokens: entry.codex_total_tokens,
+        effective_total_tokens: effective_total_tokens(entry)
       }
     }
   end
@@ -209,8 +211,10 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
+        cached_input_tokens: Map.get(running, :codex_cached_input_tokens, 0),
         output_tokens: running.codex_output_tokens,
-        total_tokens: running.codex_total_tokens
+        total_tokens: running.codex_total_tokens,
+        effective_total_tokens: effective_total_tokens(running)
       }
     }
   end
@@ -296,6 +300,40 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp effective_total_tokens(entry) when is_map(entry) do
+    case Map.get(entry, :codex_effective_total_tokens) do
+      value when is_integer(value) ->
+        value
+
+      _ ->
+        max(Map.get(entry, :codex_total_tokens, 0) - Map.get(entry, :codex_cached_input_tokens, 0), 0)
+    end
+  end
+
+  defp codex_totals_payload(tokens) when is_map(tokens) do
+    %{
+      input_tokens: Map.get(tokens, :input_tokens, 0),
+      cached_input_tokens: Map.get(tokens, :cached_input_tokens, 0),
+      output_tokens: Map.get(tokens, :output_tokens, 0),
+      total_tokens: Map.get(tokens, :total_tokens, 0),
+      effective_total_tokens:
+        Map.get(tokens, :effective_total_tokens) ||
+          max(Map.get(tokens, :total_tokens, 0) - Map.get(tokens, :cached_input_tokens, 0), 0),
+      seconds_running: Map.get(tokens, :seconds_running, 0)
+    }
+  end
+
+  defp codex_totals_payload(_tokens) do
+    %{
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      effective_total_tokens: 0,
+      seconds_running: 0
+    }
+  end
 
   @spec status_payload(GenServer.name(), timeout()) :: map()
   def status_payload(orchestrator, snapshot_timeout_ms) do

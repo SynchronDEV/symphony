@@ -21,6 +21,8 @@ workspace:
   root: ~/code/symphony-workspaces
   mirror_path: ~/code/symphony-mirror.git
   keep_last_n: 10
+  # Automatic cleanup also requires completed ledger records and clean, merged Git state.
+  cleanup_base_ref: refs/remotes/origin/main
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .

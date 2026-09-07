@@ -229,6 +229,26 @@ defmodule SymphonyElixir.CoreTest do
     assert SymphonyElixir.Ledger.get(issue_id).rework_count == 2
   end
 
+  test "ledger counts review failure routed directly back to ready for agent as rework" do
+    issue_id = "issue-observe-ready-rework-#{System.unique_integer([:positive])}"
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "Ready for Agent")
+    assert Map.get(SymphonyElixir.Ledger.get(issue_id), :rework_count, 0) == 0
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "Agent In Progress")
+    SymphonyElixir.Ledger.observe_state(issue_id, "In Review")
+    SymphonyElixir.Ledger.observe_state(issue_id, "Ready for Agent")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 1
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "Ready for Agent")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 1
+
+    SymphonyElixir.Ledger.observe_state(issue_id, "Agent In Progress")
+    SymphonyElixir.Ledger.observe_state(issue_id, "In Review")
+    SymphonyElixir.Ledger.observe_state(issue_id, "Ready for Agent")
+    assert SymphonyElixir.Ledger.get(issue_id).rework_count == 2
+  end
+
   test "ledger monotonic rework reconciliation never lowers persisted count" do
     issue_id = "issue-rework-history-#{System.unique_integer([:positive])}"
 
@@ -400,6 +420,7 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+      updated_state = await_issue_operation(updated_state, issue_id)
 
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
@@ -410,7 +431,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "terminal issue state stops running agent and cleans workspace" do
+  test "terminal issue state stops running agent and preserves workspace without merge proof" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -463,11 +484,12 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+      updated_state = await_issue_operation(updated_state, issue_id)
 
       refute Map.has_key?(updated_state.running, issue_id)
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
-      refute File.exists?(workspace)
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
@@ -583,6 +605,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+    updated_state = await_issue_operation(updated_state, issue_id)
     updated_entry = updated_state.running[issue_id]
 
     assert Map.has_key?(updated_state.running, issue_id)
@@ -631,6 +654,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+    updated_state = await_issue_operation(updated_state, issue_id)
 
     refute Map.has_key?(updated_state.running, issue_id)
     refute MapSet.member?(updated_state.claimed, issue_id)
@@ -714,6 +738,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+    updated_state = await_issue_operation(updated_state, issue_id)
 
     refute Map.has_key?(updated_state.running, issue_id)
     refute MapSet.member?(updated_state.claimed, issue_id)
@@ -1049,7 +1074,11 @@ defmodule SymphonyElixir.CoreTest do
       ]
     }
 
-    assert PromptBuilder.build_prompt(issue) == "Ticket MT-701"
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert String.starts_with?(prompt, "Ticket MT-701")
+    assert prompt =~ "Symphony Runtime Efficiency Guardrails"
+    assert prompt =~ "Do not use `gh run watch`"
   end
 
   test "prompt builder uses strict variable rendering" do
@@ -1208,7 +1237,8 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt == "Retry #2"
+    assert String.starts_with?(prompt, "Retry #2")
+    assert prompt =~ "redirect full output to a log file"
   end
 
   test "agent runner keeps workspace after successful codex run" do
@@ -1248,7 +1278,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\",\"error\":null}}}'
             exit 0
             ;;
           *)
@@ -1333,7 +1363,7 @@ defmodule SymphonyElixir.CoreTest do
               printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
               ;;
             4)
-              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-live\",\"turn\":{\"id\":\"turn-live\",\"status\":\"completed\",\"error\":null}}}'
               ;;
             *)
               ;;
@@ -1495,11 +1525,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-cont","turn":{"id":"turn-cont-1","status":"completed","error":null}}}'
             ;;
           5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"id":4,"result":{"turn":{"id":"turn-cont-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-cont","turn":{"id":"turn-cont-2","status":"completed","error":null}}}'
             ;;
         esac
       done
@@ -1629,10 +1659,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           5)
             printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-stall-same","turn":{"id":"turn-stall-1","status":"interrupted","error":null}}}'
             ;;
           6)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stall-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"id":5,"result":{"turn":{"id":"turn-stall-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-stall-same","turn":{"id":"turn-stall-2","status":"completed","error":null}}}'
             ;;
         esac
       done
@@ -1687,7 +1718,7 @@ defmodule SymphonyElixir.CoreTest do
 
       assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
       assert length(Enum.filter(json_payloads, &(&1["method"] == "thread/start"))) == 1
-      assert length(Enum.filter(json_payloads, &(&1["method"] == "thread/interrupt"))) == 1
+      assert length(Enum.filter(json_payloads, &(&1["method"] == "turn/interrupt"))) == 1
 
       turn_starts = Enum.filter(json_payloads, &(&1["method"] == "turn/start"))
       assert length(turn_starts) == 2
@@ -1740,11 +1771,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stop-label-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-stop-label","turn":{"id":"turn-stop-label-1","status":"completed","error":null}}}'
             ;;
           5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stop-label-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"id":4,"result":{"turn":{"id":"turn-stop-label-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-stop-label","turn":{"id":"turn-stop-label-2","status":"completed","error":null}}}'
             ;;
         esac
       done
@@ -1855,11 +1886,11 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-max","turn":{"id":"turn-max-1","status":"completed","error":null}}}'
             ;;
           5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"id":4,"result":{"turn":{"id":"turn-max-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-max","turn":{"id":"turn-max-2","status":"completed","error":null}}}'
             ;;
         esac
       done
@@ -1905,6 +1936,104 @@ defmodule SymphonyElixir.CoreTest do
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner stops continuing once the active state max turns is reached" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-state-max-turns-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-state-max"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-state-max-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-state-max","turn":{"id":"turn-state-max-1","status":"completed","error":null}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":4,"result":{"turn":{"id":"turn-state-max-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-state-max","turn":{"id":"turn-state-max-2","status":"completed","error":null}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3,
+        max_turns_by_state: %{"In Progress" => 1}
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-state-max-turns",
+             identifier: "MT-249",
+             title: "Stop at state max turns",
+             description: "Still active",
+             state: "In Progress"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-state-max-turns",
+        identifier: "MT-249",
+        title: "Stop at state max turns",
+        description: "Still active",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -1957,7 +2086,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
             ;;
           4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-77\",\"turn\":{\"id\":\"turn-77\",\"status\":\"completed\",\"error\":null}}}'
             exit 0
             ;;
           *)
@@ -2003,10 +2132,12 @@ defmodule SymphonyElixir.CoreTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
+                     "granular" => %{
+                       "sandbox_approval" => false,
+                       "rules" => false,
+                       "mcp_elicitations" => false,
+                       "request_permissions" => false,
+                       "skill_approval" => false
                      }
                    }
 
@@ -2036,10 +2167,12 @@ defmodule SymphonyElixir.CoreTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    expected_approval_policy = %{
-                     "reject" => %{
-                       "sandbox_approval" => true,
-                       "rules" => true,
-                       "mcp_elicitations" => true
+                     "granular" => %{
+                       "sandbox_approval" => false,
+                       "rules" => false,
+                       "mcp_elicitations" => false,
+                       "request_permissions" => false,
+                       "skill_approval" => false
                      }
                    }
 
@@ -2101,7 +2234,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
             ;;
           4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-88\",\"turn\":{\"id\":\"turn-88\",\"status\":\"completed\",\"error\":null}}}'
             exit 0
             ;;
           *)
@@ -2187,7 +2320,7 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
             ;;
           4)
-            printf '%s\\n' '{"method":"turn/completed"}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-99","turn":{"id":"turn-99","status":"completed","error":null}}}'
             exit 0
             ;;
           *)
@@ -2266,6 +2399,22 @@ defmodule SymphonyElixir.CoreTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp await_issue_operation(state, issue_id) do
+    case Map.get(state.issue_operations, issue_id) do
+      nil ->
+        state
+
+      %{task: %{ref: ref}} ->
+        receive do
+          {^ref, result} ->
+            {:noreply, state} = Orchestrator.handle_info({ref, result}, state)
+            state
+        after
+          1_000 -> flunk("issue operation did not complete")
+        end
     end
   end
 end

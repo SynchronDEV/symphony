@@ -44,6 +44,16 @@ defmodule SymphonyElixir.TokenUsageLedger do
   def append_observation(attrs, opts \\ []) when is_map(attrs) do
     file = Keyword.get(opts, :file, file_path())
     record = observation_record(attrs)
+    previous = Keyword.get(opts, :previous_observation)
+
+    if changed_observation?(previous, record) do
+      append_record(file, record)
+    else
+      :ok
+    end
+  end
+
+  defp append_record(file, record) do
     line = Jason.encode!(record) <> "\n"
 
     with :ok <- File.mkdir_p(Path.dirname(file)),
@@ -59,6 +69,18 @@ defmodule SymphonyElixir.TokenUsageLedger do
       Logger.warning("Failed to append token usage ledger record reason=#{Exception.message(error)}")
       :ok
   end
+
+  # The caller owns the previous observation in its serialized live state. Avoid
+  # a global cache that could suppress the first durable record after restart.
+  defp changed_observation?(previous, record) when is_map(previous) do
+    lifecycle_events = ~w(session_started session_final turn_completed turn_failed turn_interrupted startup_failed)
+    lifecycle? = record["final"] or record["source_event"] in lifecycle_events
+    identity_fields = ~w(issue_id issue_identifier session_id worker_host workspace_path turn_count)
+    fields = identity_fields ++ ~w(input_tokens output_tokens total_tokens)
+    lifecycle? or Map.take(observation_record(previous), fields) != Map.take(record, fields)
+  end
+
+  defp changed_observation?(_previous, _record), do: true
 
   @spec summary(keyword()) :: token_summary()
   def summary(opts \\ []) do

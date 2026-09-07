@@ -24,7 +24,10 @@ During app-server sessions, Symphony also serves a client-side `linear_graphql` 
 skills can make raw Linear GraphQL calls.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+Symphony confirms the active agent has stopped before considering cleanup. Automatic cleanup requires
+a recorded workspace/root, a configured `workspace.cleanup_base_ref` under `refs/remotes/`, clean Git
+state, no stashes, and proof that HEAD and every local branch are merged into that ref. Missing proof
+preserves the workspace. Remote automatic cleanup is disabled until equivalent checks exist.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
@@ -115,6 +118,8 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_turns_by_state:
+    "In Review": 2
 codex:
   command: codex app-server
 ---
@@ -131,10 +136,25 @@ Notes:
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
 - Safer Codex defaults are used when policy fields are omitted:
-  - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
+  - `codex.approval_policy` defaults to `{"granular":{"sandbox_approval":false,"rules":false,"mcp_elicitations":false,"request_permissions":false,"skill_approval":false}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
-- Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
+- Last verified: 2026-09-07 against Codex CLI 0.153.4's generated
+  [app-server protocol](https://developers.openai.com/codex/app-server). Its approval values are
+  `untrusted`, `on-request`, `never`, and object-form `granular`. Legacy `reject` and `on-failure`
+  are unsupported by this installed version. The default disables all five approval-prompt
+  categories; it does not grant additional permissions or automatically approve requests.
+- Explicit approval policies are forwarded unchanged, including policies intended for another
+  Codex version. Symphony does not silently migrate existing workflow permissions. Inspect the
+  installed contract with `codex app-server generate-json-schema --out <dir>` and update an
+  incompatible workflow deliberately before dispatch.
+- `codex.permission_profile` optionally selects the named permission profile expected from the
+  Codex command's `default_permissions` configuration. In this mode Symphony omits both
+  `thread/start.sandbox` and `turn/start.sandboxPolicy`, because these legacy overrides disable
+  named profiles. Startup fails before a turn if Codex's returned `activePermissionProfile.id`
+  does not exactly match. Configure and verify the profile in the launch command; Symphony does
+  not grant permissions by defining a profile name alone. With this field omitted, legacy sandbox
+  fields retain their existing behavior.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony forwards the configured map to
   Codex, but for `workspaceWrite` policies it ensures the current issue workspace stays in
@@ -146,6 +166,8 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.max_turns_by_state` overrides that cap for specific active tracker states. State names
+  are normalized for lookup, so `"In Review"` and `"in review"` refer to the same state.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -154,6 +176,11 @@ Notes:
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
 - For path values, `~` is expanded to the home directory.
+- Relative local workspace roots are anchored to the selected workflow's directory, including
+  retention and Codex sandbox checks. Existing work keeps the root captured at dispatch after reload.
+- A failed fresh-workspace bootstrap removes its partial directory so the next attempt reruns setup.
+- Retention considers only recorded completed workspaces and rechecks live ownership before removal.
+  It never scans arbitrary directories into deletion candidates; disk limits cannot override safety.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
   launched shell.
@@ -176,6 +203,35 @@ codex:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
+## Reliability and accounting
+
+Tracker polling, final dispatch refreshes, rate-limit backoff, and workspace cleanup run outside the
+orchestrator mailbox. Reservations count toward capacity while refreshes and worker stops are in
+flight. Results apply only to the operation and worker identity that requested them.
+
+Codex notifications must match the active thread and turn. Failed, interrupted, malformed, or
+unexpected terminal states cannot be treated as successful completion. A timed-out turn must receive
+an interrupt acknowledgement and terminal notification before another turn starts. Retryable Codex
+errors continue waiting; unsupported input requests block visibly.
+
+Each canonical workflow filename gets a separate `.symphony/<name>-<path-hash>/ledger.json` and
+`metrics.jsonl`. A writer lock prevents two processes from using the same ledger. Shared legacy files
+are not imported automatically: migration must supply a reviewed, scoped source while the target is
+offline. Invalid counters or JSON fail startup without overwriting evidence.
+
+Token deltas update memory immediately and flush at most once per 250 ms; zero deltas do not write.
+Lifecycle updates, explicit flush, and graceful termination flush pending values atomically using
+temporary-file sync and rename. An abrupt host/process failure may lose the last 250 ms of token
+deltas. Effective-token caps subtract cached input; they are not monetary spend limits.
+
+A crash lock deliberately fails closed. Stop all processes using that deployment, verify the recorded
+owner is gone, back up the ledger and lock, then remove the stale lock before restart. Never remove
+a live lock. Any supervised service failure restarts workers and orchestration together, preventing
+orphaned agents from surviving lost dispatch bookkeeping. This favors bounded execution over availability.
+
+The [Studio operations guide](../docs/studio-operations.md) describes the isolated launcher and
+conservative pilot configuration. Existing deployments retain their own launcher and binary.
+
 ## Web dashboard
 
 The observability UI now runs on a minimal Phoenix stack:
@@ -186,6 +242,8 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
+- Token cards and running rows report effective spend separately from raw provider totals:
+  cached input is tracked and subtracted from the headline effective token count.
 
 The JSON API includes durable token summaries from `token_usage.jsonl`:
 

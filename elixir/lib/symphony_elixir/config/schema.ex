@@ -112,14 +112,16 @@ defmodule SymphonyElixir.Config.Schema do
       field(:env, :map, default: %{})
       field(:max_total_gb, :float)
       field(:keep_last_n, :integer, default: 5)
+      field(:cleanup_base_ref, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root, :mirror_path, :env, :max_total_gb, :keep_last_n], empty_values: [])
+      |> cast(attrs, [:root, :mirror_path, :env, :max_total_gb, :keep_last_n, :cleanup_base_ref], empty_values: [])
       |> validate_number(:max_total_gb, greater_than: 0)
       |> validate_number(:keep_last_n, greater_than_or_equal_to: 0)
+      |> validate_format(:cleanup_base_ref, ~r{^refs/remotes/[^\s]+$})
     end
   end
 
@@ -158,6 +160,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_dispatch_attempts, :integer)
       field(:max_rework_cycles, :integer)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:max_turns_by_state, :map, default: %{})
       field(:prompt_template_by_state, :map, default: %{})
       field(:stop_continue_labels, {:array, :string}, default: [])
     end
@@ -175,6 +178,7 @@ defmodule SymphonyElixir.Config.Schema do
           :max_dispatch_attempts,
           :max_rework_cycles,
           :max_concurrent_agents_by_state,
+          :max_turns_by_state,
           :prompt_template_by_state,
           :stop_continue_labels
         ],
@@ -187,8 +191,10 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_dispatch_attempts, greater_than: 0)
       |> validate_number(:max_rework_cycles, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
+      |> update_change(:max_turns_by_state, &Schema.normalize_state_limits/1)
       |> update_change(:prompt_template_by_state, &Schema.normalize_state_templates/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+      |> Schema.validate_state_limits(:max_turns_by_state)
     end
   end
 
@@ -203,18 +209,26 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:approval_policy, StringOrMap,
         default: %{
-          "reject" => %{
-            "sandbox_approval" => true,
-            "rules" => true,
-            "mcp_elicitations" => true
+          "granular" => %{
+            "sandbox_approval" => false,
+            "rules" => false,
+            "mcp_elicitations" => false,
+            "request_permissions" => false,
+            "skill_approval" => false
           }
         }
       )
 
+      field(:permission_profile, :string)
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
+      # Session-startup calls (initialize, thread/start) must wait for codex to
+      # boot its full MCP-server layer (npx cold-starts) before replying, which
+      # routinely exceeds read_timeout_ms. Use this longer budget for the
+      # handshake; read_timeout_ms stays tight for mid-turn line reads.
+      field(:startup_timeout_ms, :integer, default: 60_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
       field(:elicitation_policy, :string, default: "decline")
     end
@@ -227,18 +241,22 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :command,
           :approval_policy,
+          :permission_profile,
           :thread_sandbox,
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
+          :startup_timeout_ms,
           :stall_timeout_ms,
           :elicitation_policy
         ],
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_format(:permission_profile, ~r/\A\S+\z/)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
+      |> validate_number(:startup_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_inclusion(:elicitation_policy, ["decline", "block"])
     end
@@ -507,7 +525,6 @@ defmodule SymphonyElixir.Config.Schema do
   defp resolve_optional_path_value(nil), do: nil
   defp resolve_optional_path_value(""), do: nil
   defp resolve_optional_path_value(value) when is_binary(value), do: resolve_path_value(value, nil)
-  defp resolve_optional_path_value(_value), do: nil
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
@@ -617,7 +634,8 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp expand_local_workspace_root(workspace_root)
        when is_binary(workspace_root) and workspace_root != "" do
-    Path.expand(workspace_root)
+    workflow_dir = SymphonyElixir.Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+    Path.expand(workspace_root, workflow_dir)
   end
 
   defp expand_local_workspace_root(_workspace_root) do

@@ -10,13 +10,6 @@ defmodule SymphonyElixir.Linear.Client do
   @issue_page_size 50
   @issue_history_page_size 100
   @max_error_body_log_bytes 1_000
-  @default_rate_limit_retries 1
-  # When Linear reports RATELIMITED without usable rate-limit headers
-  # (observed in production: empty headers map on the GraphQL 400 path),
-  # delay_until_reset has no reset timestamp — wait this long instead of
-  # retrying immediately into the same exhausted window.
-  @rate_limited_fallback_ms 60_000
-
   @query """
   query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
@@ -153,6 +146,9 @@ defmodule SymphonyElixir.Linear.Client do
     issue(id: $issueId) {
       history(first: $first, after: $after) {
         nodes {
+          fromState {
+            name
+          }
           toState {
             name
           }
@@ -245,7 +241,7 @@ defmodule SymphonyElixir.Linear.Client do
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
-    do_graphql_request(payload, opts, Keyword.get(opts, :rate_limit_retries, @default_rate_limit_retries))
+    do_graphql_request(payload, opts)
   end
 
   @doc false
@@ -470,66 +466,37 @@ defmodule SymphonyElixir.Linear.Client do
     operation_name <> " body=" <> body
   end
 
-  defp do_graphql_request(payload, opts, retries_left) when is_map(payload) and is_integer(retries_left) do
+  defp do_graphql_request(payload, opts) do
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
-    sleep_fun = Keyword.get(opts, :sleep_fun, &Process.sleep/1)
 
-    # Default is NON-critical: every read waits out a low budget. Only the
-    # control plane (state transitions, comments, labels — the adapter
-    # mutations) passes critical?: true to bypass the gate, since blocking
-    # those stalls issue lifecycle transitions.
-    if not Keyword.get(opts, :critical?, false) and RateLimitBudget.low?() do
-      RateLimitBudget.delay_until_reset(sleep_fun)
-    end
+    quota = if Keyword.get(opts, :critical?, false), do: :ok, else: RateLimitBudget.acquire_read()
 
-    with {:ok, headers} <- graphql_headers(),
+    with :ok <- quota,
+         {:ok, headers} <- graphql_headers(),
          {:ok, response} <- request_fun.(payload, headers) do
       RateLimitBudget.update_from_headers(Map.get(response, :headers))
-      handle_graphql_response(payload, opts, retries_left, response)
+      handle_graphql_response(payload, response)
     else
+      {:error, {:rate_limited, _}} = error ->
+        error
+
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
         {:error, {:linear_api_request, reason}}
     end
   end
 
-  defp handle_graphql_response(payload, opts, retries_left, %{status: 200, body: body}) do
-    if rate_limited_body?(body) do
-      retry_or_rate_limited(payload, opts, retries_left)
-    else
-      {:ok, body}
-    end
-  end
+  defp handle_graphql_response(payload, %{status: status, body: body} = response) do
+    cond do
+      status == 429 or rate_limited_body?(body) ->
+        {:error, {:rate_limited, RateLimitBudget.reset_at()}}
 
-  defp handle_graphql_response(payload, opts, retries_left, %{status: status, body: body} = response) do
-    if rate_limited_status?(status) or rate_limited_body?(body) do
-      retry_or_rate_limited(payload, opts, retries_left)
-    else
-      Logger.error(
-        "Linear GraphQL request failed status=#{response.status}" <>
-          linear_error_context(payload, response)
-      )
+      status == 200 ->
+        {:ok, body}
 
-      {:error, {:linear_api_status, response.status}}
-    end
-  end
-
-  defp rate_limited_status?(status), do: status == 429
-
-  defp retry_or_rate_limited(payload, opts, retries_left) do
-    reset_at = RateLimitBudget.reset_at()
-
-    if retries_left > 0 do
-      Logger.warning("Linear GraphQL request rate-limited; retrying after reset_at=#{inspect(reset_at)}")
-
-      RateLimitBudget.delay_until_reset(
-        Keyword.get(opts, :sleep_fun, &Process.sleep/1),
-        @rate_limited_fallback_ms
-      )
-
-      do_graphql_request(payload, opts, retries_left - 1)
-    else
-      {:error, {:rate_limited, reset_at}}
+      true ->
+        Logger.error("Linear GraphQL request failed status=#{status}" <> linear_error_context(payload, response))
+        {:error, {:linear_api_status, status}}
     end
   end
 
@@ -643,8 +610,11 @@ defmodule SymphonyElixir.Linear.Client do
        when is_list(nodes) do
     count =
       Enum.count(nodes, fn
-        %{"toState" => %{"name" => state_name}} -> rework_state_name?(state_name)
-        _ -> false
+        %{"toState" => %{"name" => state_name}} = event ->
+          rework_state_name?(state_name) or review_failed_to_ready?(event)
+
+        _ ->
+          false
       end)
 
     {:ok, count, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
@@ -655,6 +625,14 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp decode_issue_history_rework_count(_unknown), do: {:error, :linear_unknown_payload}
+
+  defp review_failed_to_ready?(%{"fromState" => %{"name" => from}, "toState" => %{"name" => to}})
+       when is_binary(from) and is_binary(to) do
+    String.downcase(String.trim(from)) == "in review" and
+      String.downcase(String.trim(to)) in ["ready for agent", "todo"]
+  end
+
+  defp review_failed_to_ready?(_event), do: false
 
   defp rework_state_name?(state_name) when is_binary(state_name) do
     state_name

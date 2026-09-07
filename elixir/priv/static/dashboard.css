@@ -14,6 +14,13 @@
   --accent-soft: #e8faf4;
   --danger: #b42318;
   --danger-soft: #fef3f2;
+  --danger-line: #f6d3cf;
+  --danger-highlight: #fff8f7;
+  --warning: #8a5a00;
+  --warning-soft: #fff7e8;
+  --warning-line: #f1d8a6;
+  --code-soft: #f5f5f7;
+  --code-ink: #353740;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
   --shadow-lg: 0 20px 50px rgba(15, 23, 42, 0.08);
 }
@@ -44,10 +51,11 @@ a {
 }
 
 a:hover {
-  color: var(--accent);
+  color: var(--accent-ink);
 }
 
 button {
+  min-height: 44px;
   appearance: none;
   border: 1px solid var(--accent);
   background: var(--accent);
@@ -135,6 +143,7 @@ pre,
 
 .dashboard-shell {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
 }
 
@@ -222,7 +231,7 @@ pre,
 }
 
 .status-badge-offline {
-  background: #f5f5f7;
+  background: var(--code-soft);
   border-color: var(--line-strong);
   color: var(--muted);
 }
@@ -295,6 +304,7 @@ pre,
 
 .table-wrap {
   overflow-x: auto;
+  scrollbar-color: var(--muted) var(--card-muted);
   margin-top: 1rem;
 }
 
@@ -372,14 +382,14 @@ pre,
 }
 
 .state-badge-warning {
-  background: #fff7e8;
-  border-color: #f1d8a6;
-  color: #8a5a00;
+  background: var(--warning-soft);
+  border-color: var(--warning-line);
+  color: var(--warning);
 }
 
 .state-badge-danger {
   background: var(--danger-soft);
-  border-color: #f6d3cf;
+  border-color: var(--danger-line);
   color: var(--danger);
 }
 
@@ -389,6 +399,9 @@ pre,
 }
 
 .issue-id-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
   color: inherit;
   text-decoration: underline;
   text-decoration-color: currentColor;
@@ -397,6 +410,9 @@ pre,
 }
 
 .issue-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
   color: var(--muted);
   font-size: 0.86rem;
 }
@@ -409,9 +425,9 @@ pre,
   margin-top: 1rem;
   padding: 1rem;
   border-radius: 18px;
-  background: #f5f5f7;
+  background: var(--code-soft);
   border: 1px solid var(--line);
-  color: #353740;
+  color: var(--code-ink);
   font-size: 0.9rem;
 }
 
@@ -423,8 +439,8 @@ pre,
 .error-card {
   border-radius: 24px;
   padding: 1.25rem;
-  background: linear-gradient(180deg, #fff8f7 0%, var(--danger-soft) 100%);
-  border-color: #f6d3cf;
+  background: linear-gradient(180deg, var(--danger-highlight) 0%, var(--danger-soft) 100%);
+  border-color: var(--danger-line);
 }
 
 .error-title {
