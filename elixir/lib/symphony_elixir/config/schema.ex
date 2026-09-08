@@ -157,6 +157,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_tokens_per_issue, :integer)
+      field(:min_tokens_before_dispatch, :integer, default: 0)
       field(:max_dispatch_attempts, :integer)
       field(:max_rework_cycles, :integer)
       field(:max_concurrent_agents_by_state, :map, default: %{})
@@ -175,6 +176,7 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_tokens_per_issue,
+          :min_tokens_before_dispatch,
           :max_dispatch_attempts,
           :max_rework_cycles,
           :max_concurrent_agents_by_state,
@@ -188,6 +190,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:max_tokens_per_issue, greater_than: 0)
+      |> validate_number(:min_tokens_before_dispatch, greater_than_or_equal_to: 0)
       |> validate_number(:max_dispatch_attempts, greater_than: 0)
       |> validate_number(:max_rework_cycles, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)

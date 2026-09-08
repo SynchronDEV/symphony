@@ -7,6 +7,7 @@ defmodule SymphonyElixir.CLIPreflightTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: key,
+      min_tokens_before_dispatch: 80_000,
       codex_command: ~s(codex -c 'model="old-model"' -c 'model="gpt-6-astra"' -c 'model_reasoning_effort="low"' -c 'api_key="#{key}"' app-server)
     )
 
@@ -21,6 +22,7 @@ defmodule SymphonyElixir.CLIPreflightTest do
     refute output =~ key
     assert {:ok, report} = Jason.decode(String.trim(output))
     assert report["preflight"] == "ok"
+    assert report["agent"]["min_tokens_before_dispatch"] == 80_000
     assert report["tracker"]["credential_present"]
     assert report["runtime"]["recorded_cleanup"]
     assert report["runtime"]["turn_interrupt"]

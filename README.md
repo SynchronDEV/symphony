@@ -43,6 +43,9 @@ turn handling, and deployment-isolated accounting. The opt-in Studio workflow st
 worker and hands validated staging PRs to a human. See
 [Studio operations](docs/studio-operations.md) for installation, preflight, rollout, and recovery.
 
+Fresh workers can require a configurable remaining-token reserve. Readiness hook failures block
+before Codex startup, and stopped/retrying execution states persist without resetting issue budgets.
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

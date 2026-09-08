@@ -45,8 +45,17 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          case Workspace.run_before_run_hook(workspace, issue, worker_host) do
+            :ok ->
+              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+
+            {:error, _reason} ->
+              send_codex_update(codex_update_recipient, issue, %{
+                event: :worker_preflight_failed,
+                timestamp: DateTime.utc_now()
+              })
+
+              {:error, :worker_preflight_failed}
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)

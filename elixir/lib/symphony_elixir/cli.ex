@@ -95,6 +95,7 @@ defmodule SymphonyElixir.CLI do
               max_concurrent_agents: settings.agent.max_concurrent_agents,
               max_turns: settings.agent.max_turns,
               max_tokens_per_issue: settings.agent.max_tokens_per_issue,
+              min_tokens_before_dispatch: settings.agent.min_tokens_before_dispatch,
               max_dispatch_attempts: settings.agent.max_dispatch_attempts,
               max_rework_cycles: settings.agent.max_rework_cycles,
               stop_continue_labels: settings.agent.stop_continue_labels

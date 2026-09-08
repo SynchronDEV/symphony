@@ -1364,7 +1364,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
+    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required, :worker_preflight_failed] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
@@ -1405,6 +1405,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
+  defp codex_event_blocker_error(:worker_preflight_failed), do: "worker readiness hook failed; operator correction required before retry"
   defp codex_event_blocker_error(_event), do: nil
 
   defp completion_blocker_error(completion) do
@@ -1573,6 +1574,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp block_label_for_reason(reason) when is_binary(reason) do
     cond do
+      String.starts_with?(reason, "symphony-budget-reserve") -> "symphony-hold"
+      String.starts_with?(reason, "worker readiness hook failed") -> "symphony-hold"
       String.starts_with?(reason, "symphony-budget-exceeded") -> "symphony-budget-exceeded"
       String.starts_with?(reason, "symphony-stuck") -> "symphony-stuck"
       true -> nil
@@ -1590,6 +1593,9 @@ defmodule SymphonyElixir.Orchestrator do
       is_binary(Map.get(ledger_entry, :blocked_reason)) ->
         {:block, Map.get(ledger_entry, :blocked_reason)}
 
+      reason = token_budget_block_reason(ledger_entry, settings) ->
+        {:block, reason}
+
       cap_reached?(Map.get(ledger_entry, :dispatch_count, 0), settings.max_dispatch_attempts) ->
         {:block, "symphony-stuck: max_dispatch_attempts=#{settings.max_dispatch_attempts} reached after #{Map.get(ledger_entry, :dispatch_count, 0)} dispatches"}
 
@@ -1605,6 +1611,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_cap_status(_issue), do: :ok
+
+  defp token_budget_block_reason(entry, %{max_tokens_per_issue: max_tokens} = settings) when is_integer(max_tokens) do
+    remaining = max_tokens - Map.get(entry, :cumulative_tokens, 0)
+
+    cond do
+      remaining <= 0 ->
+        "symphony-budget-exceeded: max_tokens_per_issue=#{max_tokens} reached before dispatch"
+
+      remaining < settings.min_tokens_before_dispatch ->
+        "symphony-budget-reserve: fresh worker requires #{settings.min_tokens_before_dispatch} remaining tokens"
+
+      true ->
+        nil
+    end
+  end
+
+  defp token_budget_block_reason(_entry, _settings), do: nil
 
   defp observe_rework_history(%Issue{} = issue) do
     if is_binary(issue.state) and normalize_issue_state(issue.state) in ["rework", "ready for agent", "todo"] and is_integer(Config.settings!().agent.max_rework_cycles) do
@@ -1918,6 +1941,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_issue_observation(state, id, %{kind: :cleanup}, result) do
     if match?({:error, _}, result), do: Logger.warning("Workspace cleanup preserved issue_id=#{id}: #{inspect(result)}")
+
+    Ledger.update(id, fn entry ->
+      if entry[:status] in [:running, "running"], do: Map.put(entry, :status, :stopped), else: entry
+    end)
+
     if Map.has_key?(state.retry_attempts, id), do: state, else: release_issue_claim(state, id)
   end
 
@@ -2125,6 +2153,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    Ledger.put(issue_id, %{status: :retrying})
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -2391,6 +2420,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_stopped_issue_claim(state, issue_id) do
+    Ledger.update(issue_id, fn entry ->
+      if entry[:status] in [:running, "running", :retrying, "retrying"], do: Map.put(entry, :status, :stopped), else: entry
+    end)
+
     state = state |> cancel_issue_observation(issue_id) |> cancel_issue_observation({:lease_marker, issue_id})
 
     %{
