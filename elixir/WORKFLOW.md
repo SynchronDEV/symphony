@@ -35,6 +35,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
   max_tokens_per_issue: 2000000
+  min_tokens_before_dispatch: 80000
   max_dispatch_attempts: 8
   max_rework_cycles: 3
   stop_continue_labels:

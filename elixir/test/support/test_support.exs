@@ -179,6 +179,7 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_tokens_per_issue = Keyword.get(config, :max_tokens_per_issue)
+    min_tokens_before_dispatch = Keyword.get(config, :min_tokens_before_dispatch, 0)
     max_dispatch_attempts = Keyword.get(config, :max_dispatch_attempts)
     max_rework_cycles = Keyword.get(config, :max_rework_cycles)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
@@ -234,6 +235,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_tokens_per_issue: #{yaml_value(max_tokens_per_issue)}",
+        "  min_tokens_before_dispatch: #{yaml_value(min_tokens_before_dispatch)}",
         "  max_dispatch_attempts: #{yaml_value(max_dispatch_attempts)}",
         "  max_rework_cycles: #{yaml_value(max_rework_cycles)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",

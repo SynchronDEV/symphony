@@ -224,6 +224,17 @@ Lifecycle updates, explicit flush, and graceful termination flush pending values
 temporary-file sync and rename. An abrupt host/process failure may lose the last 250 ms of token
 deltas. Effective-token caps subtract cached input; they are not monetary spend limits.
 
+`agent.min_tokens_before_dispatch` reserves effective-token headroom for each fresh worker,
+including independent review. It defaults to zero for compatibility and is applied only when
+`max_tokens_per_issue` is configured. Exhausted issues never dispatch, even with zero reserve;
+remaining tokens equal to the reserve are sufficient. A reserve rejection preserves counters
+and applies an operator hold rather than starting a worker.
+
+Failed `before_run` hooks are readiness blockers, not automatic retry loops. Correct the
+environment and explicitly release the hold before another attempt. Confirmed worker stops
+persist `stopped`, scheduled continuations persist `retrying`, and existing blocked/completed
+records retain their stronger outcome. These execution states do not mark a Linear issue Done.
+
 A crash lock deliberately fails closed. Stop all processes using that deployment, verify the recorded
 owner is gone, back up the ledger and lock, then remove the stale lock before restart. Never remove
 a live lock. Any supervised service failure restarts workers and orchestration together, preventing

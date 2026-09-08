@@ -433,6 +433,67 @@ defmodule SymphonyElixir.OrchestratorAsyncRegressionTest do
     Process.cancel_timer(stopped.tick_timer_ref)
   end
 
+  test "fresh implementation and review dispatch preserve the remaining token reserve" do
+    opts = [tracker_kind: "memory", max_tokens_per_issue: 250_000, min_tokens_before_dispatch: 80_000]
+    write_workflow_file!(Workflow.workflow_file_path(), opts)
+
+    for role <- ["Todo", "In Review"] do
+      issue = %{issue("reserve-#{role}") | state: role}
+      SymphonyElixir.Ledger.put(issue.id, %{cumulative_tokens: 170_001, dispatch_count: 1})
+      assert {:block, "symphony-budget-reserve: " <> _} = Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+      assert SymphonyElixir.Ledger.get(issue.id).cumulative_tokens == 170_001
+      assert SymphonyElixir.Ledger.get(issue.id).dispatch_count == 1
+      SymphonyElixir.Ledger.put(issue.id, %{cumulative_tokens: 170_000})
+      assert {:ok, _} = Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+    end
+  end
+
+  test "an exhausted token cap blocks dispatch even with the default zero reserve" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", max_tokens_per_issue: 250_000)
+    issue = issue("exhausted")
+    SymphonyElixir.Ledger.put(issue.id, %{cumulative_tokens: 250_000})
+    assert {:block, "symphony-budget-exceeded: " <> _} = Orchestrator.prepare_issue_for_dispatch_for_test(issue)
+  end
+
+  test "routing removal persists stopped status after confirmed worker exit without erasing budgets" do
+    issue = issue("removed-routing")
+    worker = spawn(fn -> receive do: (:stop -> :ok) end)
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+    SymphonyElixir.Ledger.put(issue.id, %{status: :running, cumulative_tokens: 1234, dispatch_count: 2})
+    state = %State{running: %{issue.id => running_entry(issue, worker)}, claimed: MapSet.new([issue.id]), codex_totals: totals(0)}
+    result = Orchestrator.reconcile_issue_states_for_test([%{issue | state: "Backlog"}], state)
+    eventually(fn -> not Process.alive?(worker) end)
+    {ref, observation} = receive_observation(result, issue.id)
+    {:noreply, result} = Orchestrator.handle_info({ref, observation}, result)
+    refute Map.has_key?(result.running, issue.id)
+    assert SymphonyElixir.Ledger.get(issue.id).status == :stopped
+    assert SymphonyElixir.Ledger.get(issue.id).cumulative_tokens == 1234
+    assert SymphonyElixir.Ledger.get(issue.id).dispatch_count == 2
+  end
+
+  test "a readiness failure blocks instead of scheduling another paid attempt" do
+    issue = issue("readiness")
+    ref = make_ref()
+    entry = Map.merge(running_entry(issue, nil), %{ref: ref, last_codex_event: :worker_preflight_failed})
+    state = %State{running: %{issue.id => entry}, claimed: MapSet.new([issue.id]), codex_totals: totals(0)}
+    {:noreply, result} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :failed}, state)
+    assert result.retry_attempts == %{}
+    assert result.blocked[issue.id].error == "worker readiness hook failed; operator correction required before retry"
+    assert SymphonyElixir.Ledger.get(issue.id).status == :blocked
+  end
+
+  test "a failing before-run hook reports readiness failure without launching Codex" do
+    root = Path.join(System.tmp_dir!(), "symphony-preflight-#{System.unique_integer([:positive])}")
+    marker = Path.join(root, "codex-started")
+    on_exit(fn -> File.rm_rf(root) end)
+    opts = [tracker_kind: "memory", workspace_root: root, hook_before_run: "exit 42", codex_command: "touch #{marker}"]
+    write_workflow_file!(Workflow.workflow_file_path(), opts)
+    issue = issue("hook-failure")
+    capture_log(fn -> assert_raise RuntimeError, fn -> AgentRunner.run(issue, self()) end end)
+    assert_receive {:codex_worker_update, _, %{event: :worker_preflight_failed}}
+    refute File.exists?(marker)
+  end
+
   defp receive_observation(state, id) do
     ref = state.issue_operations[id].task.ref
 
