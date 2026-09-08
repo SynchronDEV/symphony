@@ -70,7 +70,10 @@ Description:
 {{ issue.description }}
 
 Labels: {{ issue.labels }}
-Blockers: {{ issue.blocked_by }}
+Dependencies:
+{% for blocker in issue.blocked_by %}
+- {{ blocker.identifier }}: {{ blocker.state }}
+{% endfor %}
 
 ## Scope and roles
 

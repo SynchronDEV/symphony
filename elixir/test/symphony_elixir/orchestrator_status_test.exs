@@ -365,8 +365,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert SymphonyElixir.Ledger.get(issue_id).cumulative_tokens == 14
 
     assert_receive {:memory_tracker_label, ^issue_id, "symphony-budget-exceeded"}
-    assert_receive {:memory_tracker_comment, ^issue_id, comment}
+
+    assert_receive {:memory_tracker_comment, ^issue_id, "Symphony paused this issue because it exceeded the configured token budget." <> comment}
+
     assert comment =~ "Effective tokens: 14"
+    assert comment =~ "Raw tokens (current session): 202"
+    assert comment =~ "Cached input tokens (current session): 188"
+    assert comment =~ "Budget: 10"
   end
 
   test "session completion preserves effective cached-token budget accounting" do
