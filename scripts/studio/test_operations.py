@@ -180,6 +180,17 @@ class StudioOperationsTest(unittest.TestCase):
         with self.assertRaisesRegex(preflight.CheckError, "lacks Codex policy details"):
             preflight.validate_configured_policies(None, {}, {})
 
+    def test_workflow_allows_only_disposable_database_migration_proofs(self):
+        text = (Path(__file__).resolve().parents[2] / "workflows/studio.md").read_text()
+        prompt = " ".join(text.split("---", 2)[2].split())
+        self.assertIn("run migrations against hosted or shared databases", prompt)
+        self.assertIn("disposable, isolated test database with no existing data", prompt)
+        self.assertIn("run migrations and database proof tests against it", prompt)
+        self.assertIn("worker-owned test resources and synthetic fixtures", prompt)
+        self.assertIn("never use hosted/shared databases, copied user data or hosted credentials", prompt)
+        self.assertIn("Tear down only the disposable resources created for that proof", prompt)
+        self.assertNotIn("run database migrations,", prompt)
+
     def test_workflow_preserves_staging_limits_and_existing_statuses(self):
         text = (Path(__file__).resolve().parents[2] / "workflows/studio.md").read_text()
         config, prompt = text.split("---", 2)[1:]

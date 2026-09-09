@@ -134,11 +134,17 @@ Implementation may commit its scoped changes, push its issue branch, open or
 update its PR, and write the assigned Linear workpad/state/labels. Follow
 Conventional Commits and include a changeset for shipped behavior. Do not push
 to staging or main. Do not approve, merge or enable auto-merge on any PR. Do not
-publish releases, deploy production/staging/Lambda, run database migrations,
-change external credentials or perform destructive external operations. Those
-remain human actions even if a repository guide suggests deploying a render
-change. Describe the required deploy and its unverified export boundary in the
+publish releases, deploy production/staging/Lambda, run migrations against hosted
+or shared databases, change external credentials or perform destructive external
+operations. Those remain human actions even if a repository guide suggests
+deploying a render change. Describe the required deploy and its unverified export boundary in the
 handoff instead. Never bypass a validation or Git hook with --no-verify.
+
+For validation only, you may create a disposable, isolated test database with no
+existing data and run migrations and database proof tests against it. Use only
+worker-owned test resources and synthetic fixtures; never use hosted/shared
+databases, copied user data or hosted credentials. Tear down only the disposable
+resources created for that proof and retain its results in the workpad.
 
 ## Implementing
 
