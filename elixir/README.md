@@ -34,11 +34,13 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 Linear issue can become a dispatch candidate again after restart.
 
-Claimed issues also get a Symphony claim lease marker through the tracker comment API. The lease
-records the last-seen worker id, workspace path, attempt number, last heartbeat time, and expiry.
-Active workers refresh the lease during poll and Codex activity; retry and blocked transitions
-update the same lease state. If a non-live claim lease expires, Symphony logs the recovery and
-requeues the issue without starting a duplicate worker for a still-running claim.
+Claimed issues also get a Symphony claim lease marker through the tracker comment API. Comments
+are point-in-time snapshots published on the initial claim and material ownership, retry, or blocked
+transitions. Routine heartbeats refresh the internal lease without adding tracker comments; the
+dashboard and JSON API expose the current last-seen worker, workspace, attempt, heartbeat, and expiry.
+Failed marker publications retain retry backoff and are superseded by newer material transitions.
+If a non-live claim lease expires, Symphony logs the recovery and requeues the issue without starting
+a duplicate worker for a still-running claim.
 
 ## How to use it
 

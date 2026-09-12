@@ -21,7 +21,7 @@ defmodule SymphonyElixir.Orchestrator do
   @rate_limit_retry_ms 300_000
   @minimum_claim_lease_ttl_ms 60_000
   @claim_lease_ttl_poll_multiplier 3
-  @claim_lease_marker_interval_ms 60_000
+  @claim_lease_marker_retry_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -1033,12 +1033,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_publish_claim_lease_marker(issue_id, previous, lease, now_ms, opts) do
-    if claim_lease_marker_due?(previous, lease, now_ms, opts) do
+    if claim_lease_marker_due?(previous, lease, opts) do
       generation = make_ref()
       send(self(), {:publish_claim_lease_marker, issue_id, claim_lease_marker_body(lease), generation})
       lease |> Map.put(:last_marker_at_ms, now_ms) |> Map.put(:marker_generation, generation)
     else
-      inherit_last_marker_at(lease, previous)
+      inherit_marker_publication(lease, previous)
     end
   end
 
@@ -1068,12 +1068,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp claim_lease_marker_due?(nil, _lease, _now_ms, _opts), do: true
+  defp claim_lease_marker_due?(nil, _lease, _opts), do: true
 
-  defp claim_lease_marker_due?(previous, lease, now_ms, opts) do
+  defp claim_lease_marker_due?(previous, lease, opts) do
     Keyword.get(opts, :force, false) or
-      claim_lease_material_change?(previous, lease) or
-      claim_lease_marker_interval_due?(previous, now_ms)
+      claim_lease_material_change?(previous, lease)
   end
 
   defp claim_lease_material_change?(previous, lease) do
@@ -1084,17 +1083,10 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp claim_lease_marker_interval_due?(previous, now_ms) do
-    case Map.get(previous, :last_marker_at_ms) do
-      marker_at_ms when is_integer(marker_at_ms) -> now_ms - marker_at_ms >= @claim_lease_marker_interval_ms
-      _ -> true
-    end
-  end
+  defp inherit_marker_publication(lease, nil), do: lease
 
-  defp inherit_last_marker_at(lease, nil), do: lease
-
-  defp inherit_last_marker_at(lease, previous) do
-    Map.put(lease, :last_marker_at_ms, Map.get(previous, :last_marker_at_ms))
+  defp inherit_marker_publication(lease, previous) do
+    Map.merge(lease, Map.take(previous, [:last_marker_at_ms, :marker_generation]))
   end
 
   defp safe_create_tracker_comment(issue_id, body) do
@@ -1110,7 +1102,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp claim_lease_marker_body(lease) do
-    ["## Symphony Claim Lease", "" | claim_lease_marker_lines(lease)]
+    [
+      "## Symphony Claim Lease",
+      "",
+      "Point-in-time ownership snapshot. Routine heartbeats and current lease expiry are available in the Symphony dashboard and API.",
+      "" | claim_lease_marker_lines(lease)
+    ]
     |> Enum.join("\n")
   end
 
@@ -1886,7 +1883,7 @@ defmodule SymphonyElixir.Orchestrator do
           other -> other
         end
 
-      delay = if rate_limited_error?(reason), do: rate_limit_retry_delay(reason), else: @claim_lease_marker_interval_ms
+      delay = if rate_limited_error?(reason), do: rate_limit_retry_delay(reason), else: @claim_lease_marker_retry_ms
       Process.send_after(self(), {:publish_claim_lease_marker, id, marker.body, marker.stamp}, delay)
     end
 
