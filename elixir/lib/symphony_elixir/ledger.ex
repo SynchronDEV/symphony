@@ -57,12 +57,34 @@ defmodule SymphonyElixir.Ledger do
     GenServer.call(__MODULE__, :all)
   end
 
+  @doc "Returns the last durably committed ledger without waiting for an in-flight filesystem write."
+  @spec committed_snapshot(GenServer.server()) :: map()
+  def committed_snapshot(server \\ __MODULE__) do
+    table = :persistent_term.get({__MODULE__, :committed_snapshot, server}, nil)
+    [{:entries, entries}] = :ets.lookup(table, :entries)
+    entries
+  rescue
+    ArgumentError -> %{}
+  end
+
   @spec increment(issue_id(), atom(), integer()) :: issue_entry()
   def increment(issue_id, key, amount \\ 1)
       when is_binary(issue_id) and is_atom(key) and is_integer(amount) do
     update(issue_id, fn entry ->
       Map.update(entry, key, amount, &increment_value(&1, amount))
     end)
+  end
+
+  @doc "Atomically records a stall and durable quarantine; callers must enforce their own operation deadline."
+  @spec quarantine_stall(issue_id(), String.t()) :: issue_entry()
+  def quarantine_stall(issue_id, reason) when is_binary(issue_id) and is_binary(reason) do
+    update = fn entry ->
+      entry
+      |> Map.update(:stall_events, 1, &increment_value(&1, 1))
+      |> Map.merge(%{status: :blocked, blocked_reason: reason})
+    end
+
+    GenServer.call(__MODULE__, {:update, issue_id, update}, :infinity)
   end
 
   defp increment_value(value, amount) when is_integer(value), do: value + amount
@@ -137,7 +159,24 @@ defmodule SymphonyElixir.Ledger do
          {:ok, lock} <- acquire_lock(canonical_path, Keyword.get(opts, :lock_writer, &:file.write/2)) do
       case load(canonical_path) do
         {:ok, entries} ->
-          {:ok, %{path: canonical_path, entries: entries, lock: lock, dirty: false, timer: nil, flush_interval_ms: Keyword.get(opts, :flush_interval_ms, 250), writes: 0}}
+          snapshot_key = {__MODULE__, :committed_snapshot, Keyword.get(opts, :name, __MODULE__)}
+          snapshot_table = :ets.new(__MODULE__, [:set, :protected, read_concurrency: true])
+          :ets.insert(snapshot_table, {:entries, entries})
+          :persistent_term.put(snapshot_key, snapshot_table)
+
+          {:ok,
+           %{
+             path: canonical_path,
+             entries: entries,
+             lock: lock,
+             dirty: false,
+             timer: nil,
+             flush_interval_ms: Keyword.get(opts, :flush_interval_ms, 250),
+             writes: 0,
+             snapshot_key: snapshot_key,
+             snapshot_table: snapshot_table,
+             file_sync: Keyword.get(opts, :file_sync, &:file.sync/1)
+           }}
 
         {:error, reason} ->
           release_lock(lock)
@@ -183,6 +222,7 @@ defmodule SymphonyElixir.Ledger do
     persist_pending!(state)
   after
     release_lock(state.lock)
+    :persistent_term.erase(state.snapshot_key)
   end
 
   # Edge-triggered rework counter shared by EVERY place an issue state is
@@ -335,11 +375,12 @@ defmodule SymphonyElixir.Ledger do
 
   defp persist_pending!(state) do
     if state.timer, do: Process.cancel_timer(state.timer)
-    persist!(state.path, state.entries)
+    persist!(state.path, state.entries, state.file_sync)
+    :ets.insert(state.snapshot_table, {:entries, state.entries})
     %{state | dirty: false, timer: nil, writes: state.writes + 1}
   end
 
-  defp persist!(path, entries) when is_binary(path) and is_map(entries) do
+  defp persist!(path, entries, file_sync \\ &:file.sync/1) when is_binary(path) and is_map(entries) do
     encoded =
       entries
       |> Map.new(fn {issue_id, entry} -> {issue_id, stringify_entry(entry)} end)
@@ -352,7 +393,7 @@ defmodule SymphonyElixir.Ledger do
 
       try do
         :ok = IO.binwrite(file, encoded)
-        :ok = :file.sync(file)
+        :ok = file_sync.(file)
       after
         File.close(file)
       end
