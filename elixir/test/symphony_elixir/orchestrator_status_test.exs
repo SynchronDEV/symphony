@@ -1574,6 +1574,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_receive {:memory_tracker_comment, "issue-lease", body}
     assert body =~ "## Symphony Claim Lease"
+    assert body =~ "Point-in-time ownership snapshot"
+    assert body =~ "Symphony dashboard and API"
     assert body =~ "- state: active"
     assert body =~ "- worker_id: local:"
     assert body =~ "- workspace_path: /tmp/symphony_workspaces/MT-LEASE"
@@ -1581,7 +1583,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert body =~ "- lease_expires_at:"
   end
 
-  test "claim lease heartbeat refresh updates last seen and lease expiry" do
+  test "routine claim lease heartbeats renew expiry without adding tracker comments" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 
@@ -1623,9 +1625,66 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert refreshed_lease.lease_expires_at_ms > stale_expires_at_ms
     assert refreshed_lease.heartbeat_count == old_lease.heartbeat_count + 1
 
+    assert refreshed_lease.marker_generation == old_lease.marker_generation
+    assert refreshed_lease.last_marker_at_ms == stale_marker_at_ms
+
+    final_state =
+      Enum.reduce(1..3, refreshed_state, fn _, state ->
+        state = put_in(state.claim_leases[issue.id].last_marker_at_ms, System.monotonic_time(:millisecond) - 90_000)
+        Orchestrator.refresh_claim_lease_from_running_for_test(state, issue.id, running_entry)
+      end)
+
+    assert final_state.claim_leases[issue.id].heartbeat_count == old_lease.heartbeat_count + 4
+    refute_receive {:memory_tracker_comment, "issue-heartbeat", _body}
+
+    changed_state =
+      Orchestrator.refresh_claim_lease_from_running_for_test(final_state, issue.id, %{running_entry | worker_host: "worker-b"})
+
+    assert changed_state.claim_leases[issue.id].marker_generation != old_lease.marker_generation
     assert_receive {:memory_tracker_comment, "issue-heartbeat", body}
-    assert body =~ "- state: active"
+    assert body =~ "- worker_host: worker-b"
+  end
+
+  test "a delayed claim marker survives routine refresh and stale generations are superseded" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    issue = %Issue{id: "issue-delayed-lease", identifier: "MT-DELAYED", title: "Delayed lease", state: "In Progress"}
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: "worker-a",
+      workspace_path: "/workspaces/MT-DELAYED",
+      started_at: DateTime.utc_now()
+    }
+
+    state =
+      %Orchestrator.State{max_concurrent_agents: 1, issue_operations: %{busy: %{}}}
+      |> Orchestrator.start_claim_lease_for_test(issue, running_entry)
+
+    pending = state.marker_pending[issue.id]
+    state = put_in(state.claim_leases[issue.id].last_marker_at_ms, System.monotonic_time(:millisecond) - 90_000)
+    state = Orchestrator.refresh_claim_lease_from_running_for_test(state, issue.id, running_entry)
+    assert state.claim_leases[issue.id].marker_generation == pending.stamp
+    assert state.marker_pending[issue.id] == pending
+    refute_receive {:memory_tracker_comment, "issue-delayed-lease", _body}
+
+    state = publish_test_marker(%{state | issue_operations: %{}}, issue.id, pending)
+    assert_receive {:memory_tracker_comment, "issue-delayed-lease", body}
     assert body =~ "- worker_host: worker-a"
+
+    state = %{state | issue_operations: %{busy: %{}}}
+    state = Orchestrator.refresh_claim_lease_from_running_for_test(state, issue.id, %{running_entry | worker_host: "worker-b"})
+    current = state.marker_pending[issue.id]
+    assert current.stamp != pending.stamp
+
+    state = publish_test_marker(%{state | issue_operations: %{}}, issue.id, pending)
+    assert_receive {:memory_tracker_comment, "issue-delayed-lease", body}
+    assert body =~ "- worker_host: worker-b"
+    assert state.claim_leases[issue.id].marker_generation == current.stamp
+    refute_receive {:memory_tracker_comment, "issue-delayed-lease", _body}
   end
 
   test "expired claim leases are requeued and logged" do
@@ -1677,6 +1736,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert_receive {:memory_tracker_comment, "issue-expired-lease", body}
     assert body =~ "- state: retrying"
     assert body =~ "- retry_backoff_ms: 0"
+    assert body =~ "- error: claim lease expired"
   end
 
   test "expired claim lease recovery does not duplicate live workers" do
@@ -2352,6 +2412,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert rendered =~ "app_status=offline"
     refute rendered =~ "Timestamp:"
+  end
+
+  defp publish_test_marker(state, issue_id, marker) do
+    {:noreply, state} = Orchestrator.handle_info({:publish_claim_lease_marker, issue_id, marker.body, marker.stamp}, state)
+    ref = state.issue_operations[{:lease_marker, issue_id}].task.ref
+    assert_receive {^ref, result}, 1_000
+    {:noreply, state} = Orchestrator.handle_info({ref, result}, state)
+    state
   end
 
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
