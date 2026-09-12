@@ -2,6 +2,7 @@ defmodule SymphonyElixir.OrchestratorAsyncRegressionTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.IssueStateBatcher
+  alias SymphonyElixir.Ledger
   alias SymphonyElixir.Orchestrator.State
 
   setup do
@@ -490,8 +491,179 @@ defmodule SymphonyElixir.OrchestratorAsyncRegressionTest do
     write_workflow_file!(Workflow.workflow_file_path(), opts)
     issue = issue("hook-failure")
     capture_log(fn -> assert_raise RuntimeError, fn -> AgentRunner.run(issue, self()) end end)
+    assert_receive {:worker_preparation_phase, _, :workspace, %DateTime{}}
+    assert_receive {:worker_preparation_phase, _, :before_run, %DateTime{}}
     assert_receive {:codex_worker_update, _, %{event: :worker_preflight_failed}}
+    refute_receive {:worker_preparation_phase, _, :codex_startup, _}
     refute File.exists?(marker)
+  end
+
+  test "preparation stages have separate bounded clocks before Codex activity begins" do
+    opts = [tracker_kind: "memory", codex_stall_timeout_ms: 1_000, hook_timeout_ms: 60_000]
+    write_workflow_file!(Workflow.workflow_file_path(), opts)
+    {server, name, issue, worker} = stalled_server("preparation")
+    stage_at = DateTime.add(DateTime.utc_now(), -10, :second)
+
+    for stage <- [:workspace, :before_run, :codex_startup] do
+      send(server, {:worker_preparation_phase, issue.id, stage, stage_at})
+      send(server, :tick)
+      assert [%{issue_id: id}] = Orchestrator.snapshot(name, 200).running
+      assert id == issue.id
+      assert Process.alive?(worker)
+      assert :sys.get_state(server).running[issue.id].preparation_started_at == stage_at
+    end
+
+    send(server, {:worker_preparation_phase, issue.id, :ready, DateTime.utc_now()})
+    send(server, :tick)
+    assert [_] = Orchestrator.snapshot(name, 200).running
+
+    send(server, {:codex_worker_update, issue.id, %{event: :notification, timestamp: stage_at}})
+    send(server, :tick)
+    eventually(fn -> Map.has_key?(:sys.get_state(server).retry_attempts, issue.id) end)
+    refute Process.alive?(worker)
+    assert Ledger.get(issue.id).stall_events == 1
+  end
+
+  test "a preparation phase that exceeds its own hook deadline is still recovered" do
+    opts = [tracker_kind: "memory", codex_stall_timeout_ms: 1_000, hook_timeout_ms: 2_000]
+    write_workflow_file!(Workflow.workflow_file_path(), opts)
+    {server, _name, issue, worker} = stalled_server("hung-preparation")
+    send(server, {:worker_preparation_phase, issue.id, :before_run, DateTime.add(DateTime.utc_now(), -5, :second)})
+    send(server, :tick)
+    eventually(fn -> Map.has_key?(:sys.get_state(server).retry_attempts, issue.id) end)
+    refute Process.alive?(worker)
+    assert Ledger.get(issue.id).stall_events == 1
+  end
+
+  test "slow durable stall accounting leaves snapshots responsive and retries only after acknowledgement" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", codex_stall_timeout_ms: 1_000)
+    {server, name, issue, worker} = stalled_server("slow-stall-accounting")
+    ledger = hold_next_ledger_sync()
+    send(server, :tick)
+    assert_receive {:ledger_sync_waiting, ^ledger}, 1_000
+    refute Process.alive?(worker)
+    assert Orchestrator.snapshot(name, 200).running == []
+    assert :sys.get_state(server).retry_attempts == %{}
+    refute Map.has_key?(Ledger.committed_snapshot(), issue.id)
+
+    # Cross the former synchronous GenServer.call deadline while the real fsync
+    # is held. The dispatcher must remain alive and must not replay the increment.
+    refute_receive {:ledger_sync_finished, ^ledger}, 5_100
+    assert is_map(Orchestrator.snapshot(name, 200))
+    assert :sys.get_state(server).retry_attempts == %{}
+    send(ledger, :allow_ledger_sync)
+    assert_receive {:ledger_sync_finished, ^ledger}, 1_000
+    eventually(fn -> Map.has_key?(:sys.get_state(server).retry_attempts, issue.id) end)
+    assert Ledger.get(issue.id).stall_events == 1
+    assert Ledger.committed_snapshot()[issue.id].stall_events == 1
+    assert Ledger.get(issue.id).blocked_reason == nil
+  end
+
+  test "an ambiguous stall accounting deadline stays blocked after a late durable write" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", codex_stall_timeout_ms: 1_000)
+    {server, name, issue, worker} = stalled_server("unknown-stall-accounting")
+    ledger = hold_next_ledger_sync()
+    send(server, :tick)
+    assert_receive {:ledger_sync_waiting, ^ledger}, 1_000
+    op = :sys.get_state(server).issue_operations[issue.id]
+    send(server, {:observation_timeout, op.task.ref})
+    assert is_map(Orchestrator.snapshot(name, 200))
+    refute Process.alive?(worker)
+    assert :sys.get_state(server).blocked[issue.id].error =~ "accounting unconfirmed"
+    send(ledger, :allow_ledger_sync)
+    assert_receive {:ledger_sync_finished, ^ledger}, 1_000
+    assert Ledger.get(issue.id).stall_events == 1
+
+    send(server, {op.task.ref, :ok})
+    send(server, :tick)
+    assert Orchestrator.snapshot(name, 200).running == []
+    state = :sys.get_state(server)
+    assert MapSet.member?(state.claimed, issue.id)
+    assert state.retry_attempts == %{}
+    assert state.blocked[issue.id].error =~ "accounting unconfirmed"
+    assert Ledger.get(issue.id).stall_events == 1
+
+    stop_supervised!(Orchestrator)
+    opts = [name: name, candidate_fetcher: fn _ -> {:ok, [issue]} end, issue_fetcher: fn _ -> {:ok, [issue]} end]
+    restarted = start_supervised!({Orchestrator, opts})
+    eventually(fn -> Map.has_key?(:sys.get_state(restarted).blocked, issue.id) end)
+    assert Orchestrator.snapshot(name, 200).running == []
+    assert :sys.get_state(restarted).retry_attempts == %{}
+    assert Ledger.get(issue.id).blocked_reason =~ "accounting unconfirmed"
+    assert Ledger.get(issue.id).stall_events == 1
+    persisted = Ledger.info().path |> File.read!() |> Jason.decode!()
+    assert persisted[issue.id]["blocked_reason"] =~ "accounting unconfirmed"
+    assert persisted[issue.id]["stall_events"] == 1
+  end
+
+  test "durable snapshots are isolated by ledger owner and synchronous counter APIs remain compatible" do
+    assert Ledger.increment("compatibility", :stall_events) == %{stall_events: 1}
+    assert Ledger.all()["compatibility"].stall_events == 1
+    assert Ledger.committed_snapshot()["compatibility"].stall_events == 1
+    Ledger.put("compatibility", %{cumulative_tokens: 1234, dispatch_count: 2})
+    quarantined = Ledger.quarantine_stall("compatibility", "repeated stall requires review")
+    assert quarantined.stall_events == 2
+    assert quarantined.cumulative_tokens == 1234
+    assert quarantined.dispatch_count == 2
+    assert quarantined.blocked_reason == "repeated stall requires review"
+
+    name = unique_name()
+    path = Path.join(System.tmp_dir!(), "symphony-snapshot-#{name}.json")
+    on_exit(fn -> File.rm(path) end)
+    named = start_supervised!({Ledger, name: name, path: path})
+    assert Ledger.committed_snapshot(name) == %{}
+    assert %{stall_events: 2} = GenServer.call(named, {:update, "other", fn _ -> %{stall_events: 2} end})
+    assert Ledger.committed_snapshot(name) == %{"other" => %{stall_events: 2}}
+    refute Map.has_key?(Ledger.committed_snapshot(), "other")
+    stop_supervised!(Ledger)
+    assert Ledger.committed_snapshot(name) == %{}
+  end
+
+  defp stalled_server(id) do
+    issue = issue(id)
+    worker = spawn(fn -> receive do: (:finish -> :ok) end)
+    on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+    name = unique_name()
+    opts = [name: name, candidate_fetcher: fn _ -> {:ok, []} end, issue_fetcher: fn _ -> {:ok, [issue]} end]
+    server = start_supervised!({Orchestrator, opts})
+    eventually(fn -> is_nil(:sys.get_state(server).poll_task) end)
+
+    :sys.replace_state(server, fn state ->
+      entry = %{running_entry(issue, worker) | started_at: DateTime.add(DateTime.utc_now(), -10, :second)}
+      %{state | running: %{issue.id => entry}, claimed: MapSet.new([issue.id])}
+    end)
+
+    {server, name, issue, worker}
+  end
+
+  defp hold_next_ledger_sync do
+    parent = self()
+    ledger = Process.whereis(Ledger)
+    once = make_ref()
+
+    sync = fn file ->
+      if Process.get(once) do
+        :file.sync(file)
+      else
+        Process.put(once, :waiting)
+        send(parent, {:ledger_sync_waiting, self()})
+        receive do: (:allow_ledger_sync -> :ok)
+        result = :file.sync(file)
+        Process.put(once, :done)
+        send(parent, {:ledger_sync_finished, self()})
+        result
+      end
+    end
+
+    :sys.replace_state(ledger, &%{&1 | file_sync: sync})
+
+    on_exit(fn ->
+      {:dictionary, dictionary} = Process.info(ledger, :dictionary)
+      if List.keyfind(dictionary, once, 0) == {once, :waiting}, do: send(ledger, :allow_ledger_sync)
+      :sys.replace_state(ledger, fn state -> %{state | file_sync: &:file.sync/1} end)
+    end)
+
+    ledger
   end
 
   defp receive_observation(state, id) do

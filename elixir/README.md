@@ -42,6 +42,21 @@ Failed marker publications retain retry backoff and are superseded by newer mate
 If a non-live claim lease expires, Symphony logs the recovery and requeues the issue without starting
 a duplicate worker for a still-running claim.
 
+Workspace creation, the before-run hook, and Codex startup have separate preparation clocks. Hook
+and startup timeout settings remain the authority for those phases; preparation does not consume
+one aggregate Codex inactivity window. Codex activity takes over the inactivity clock after startup.
+
+Stall recovery stops and quarantines the worker while its counter is committed by a bounded
+background operation. Retry is allowed only after the durable write is acknowledged. An operation
+deadline or write failure leaves the claim blocked for operator reconciliation, because a timed-out
+write may still commit; the counter and quarantine are persisted atomically and the increment is
+never replayed automatically. A late commit therefore remains blocked across service restarts.
+Only an acknowledged recovery clears that durable quarantine before scheduling a retry.
+Snapshots and retention scans read an owned ETS cache of the last durably committed ledger during
+an in-flight write; authorization and budget gates continue to use authoritative ledger reads.
+Other synchronous ledger operations still depend on filesystem responsiveness; this recovery path
+does not make the whole service immune to storage stalls.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see

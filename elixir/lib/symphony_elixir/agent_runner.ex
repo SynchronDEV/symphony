@@ -39,10 +39,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    send_preparation_phase(codex_update_recipient, issue, :workspace)
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_preparation_phase(codex_update_recipient, issue, :before_run)
 
         try do
           case Workspace.run_before_run_hook(workspace, issue, worker_host) do
@@ -80,6 +82,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
+  defp send_preparation_phase(recipient, %Issue{id: issue_id}, phase) when is_pid(recipient) do
+    send(recipient, {:worker_preparation_phase, issue_id, phase, DateTime.utc_now()})
+  end
+
+  defp send_preparation_phase(_recipient, _issue, _phase), do: :ok
+
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
@@ -97,10 +105,13 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+    send_preparation_phase(codex_update_recipient, issue, :codex_startup)
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &IssueStateBatcher.fetch_issue_states_by_ids/1)
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+      send_preparation_phase(codex_update_recipient, issue, :ready)
+
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after

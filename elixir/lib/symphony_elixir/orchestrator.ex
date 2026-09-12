@@ -234,6 +234,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_info({:worker_preparation_phase, issue_id, phase, %DateTime{} = timestamp}, %{running: running} = state)
+      when phase in [:workspace, :before_run, :codex_startup, :ready] do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      entry ->
+        entry = Map.merge(entry, %{preparation_phase: phase, preparation_started_at: timestamp})
+        state = %{state | running: Map.put(running, issue_id, entry)}
+        notify_dashboard()
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
       when is_binary(issue_id) and is_map(runtime_info) do
     case Map.get(running, issue_id) do
@@ -1302,43 +1316,60 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
+    timeout_ms = preparation_timeout_ms(running_entry, timeout_ms)
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
     if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
-      identifier = Map.get(running_entry, :identifier, issue_id)
-      session_id = running_entry_session_id(running_entry)
-
-      if input_required_blocker?(running_entry) do
-        error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
-        Ledger.increment(issue_id, :stall_events)
-
-        Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
-
-        state
-        |> record_session_completion_totals(running_entry)
-        |> stop_and_block_issue(issue_id, running_entry, error)
-      else
-        Ledger.increment(issue_id, :stall_events)
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
-
-        next_attempt = next_retry_attempt_from_running(running_entry)
-        previous_lease = Map.get(state.claim_leases, issue_id)
-
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> restore_claim_lease(issue_id, previous_lease)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity",
-          worker_host: Map.get(running_entry, :worker_host),
-          workspace_path: Map.get(running_entry, :workspace_path),
-          previous_attempt: previous_attempt_from_running(running_entry),
-          worker_id: lease_worker_id(running_entry)
-        })
-      end
+      begin_stall_recovery(state, issue_id, running_entry, elapsed_ms)
     else
       state
+    end
+  end
+
+  defp begin_stall_recovery(state, issue_id, entry, elapsed_ms) do
+    if is_reference(entry[:ref]), do: Process.demonitor(entry.ref, [:flush])
+    error = "stalled for #{elapsed_ms}ms; awaiting durable recovery accounting"
+    state = block_issue_from_entry(state, issue_id, entry, error, false)
+
+    start_issue_observation(state, issue_id, %{kind: :stall_recovery, entry: entry, elapsed_ms: elapsed_ms}, fn ->
+      with :ok <- stop_running_task(entry[:pid], nil) do
+        # This task has the observation deadline. Never replay this non-idempotent
+        # increment after an ambiguous timeout; only a durable acknowledgement permits retry.
+        Ledger.quarantine_stall(issue_id, "stall recovery accounting unconfirmed; operator review required before retry")
+        :ok
+      end
+    end)
+  end
+
+  defp complete_stall_recovery(state, issue_id, running_entry, elapsed_ms) do
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    session_id = running_entry_session_id(running_entry)
+
+    if input_required_blocker?(running_entry) do
+      error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
+      Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
+
+      state
+      |> record_session_completion_totals(running_entry)
+      |> stop_and_block_issue(issue_id, running_entry, error)
+    else
+      Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+      next_attempt = next_retry_attempt_from_running(running_entry)
+      previous_lease = Map.get(state.claim_leases, issue_id)
+
+      state
+      |> terminate_running_issue(issue_id, false)
+      |> restore_claim_lease(issue_id, previous_lease)
+      |> schedule_issue_retry(issue_id, next_attempt, %{
+        identifier: identifier,
+        issue_url: running_entry.issue.url,
+        error: "stalled for #{elapsed_ms}ms without codex activity",
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        previous_attempt: previous_attempt_from_running(running_entry),
+        worker_id: lease_worker_id(running_entry)
+      })
     end
   end
 
@@ -1355,10 +1386,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_codex_timestamp) ||
+      Map.get(running_entry, :preparation_started_at) || Map.get(running_entry, :started_at)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
+
+  defp preparation_timeout_ms(%{preparation_phase: phase, last_codex_timestamp: nil}, timeout_ms)
+       when phase in [:workspace, :before_run] do
+    max(Config.settings!().hooks.timeout_ms, timeout_ms)
+  end
+
+  defp preparation_timeout_ms(%{preparation_phase: :codex_startup, last_codex_timestamp: nil}, timeout_ms) do
+    max(Config.settings!().codex.startup_timeout_ms, timeout_ms)
+  end
+
+  defp preparation_timeout_ms(_entry, timeout_ms), do: timeout_ms
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required, :worker_preflight_failed] or
@@ -1472,12 +1515,14 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
-    Ledger.put(issue_id, %{
-      blocked_reason: error,
-      status: :blocked,
-      last_thread_id: running_entry_session_id(running_entry)
-    })
+  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, persist? \\ true) do
+    if persist? do
+      Ledger.put(issue_id, %{
+        blocked_reason: error,
+        status: :blocked,
+        last_thread_id: running_entry_session_id(running_entry)
+      })
+    end
 
     blocked_entry = %{
       issue_id: issue_id,
@@ -1888,6 +1933,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
 
     state
+  end
+
+  defp apply_issue_observation(state, id, %{kind: :stall_recovery} = op, :ok) do
+    Ledger.put(id, %{status: :stopped, blocked_reason: nil})
+    state = %{state | blocked: Map.delete(state.blocked, id), running: Map.put(state.running, id, op.entry)}
+    complete_stall_recovery(state, id, op.entry, op.elapsed_ms)
+  end
+
+  defp apply_issue_observation(state, id, %{kind: :stall_recovery, entry: entry}, result) do
+    error = "stall recovery accounting unconfirmed; operator review required before retry: #{inspect(result)}"
+    Logger.error("#{error} issue_id=#{id}")
+    block_issue_from_entry(state, id, entry, error, false)
   end
 
   defp apply_issue_observation(state, id, %{kind: :retry} = op, {:ok, issues}) do
@@ -2301,7 +2358,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp completed_at(_value), do: nil
 
   defp retention_records(state) do
-    Ledger.all()
+    Ledger.committed_snapshot()
     |> Enum.flat_map(fn {id, entry} ->
       if entry[:status] in [:completed, "completed"] and not protected_issue?(state, id, entry[:workspace_path]) do
         [Map.merge(entry, %{issue_id: id, status: :completed, completed_at: completed_at(entry[:completed_at]), eligible: is_binary(entry[:merged_into])})]
@@ -2839,7 +2896,7 @@ defmodule SymphonyElixir.Orchestrator do
        claim_leases: claim_leases,
        expired: expired,
        codex_totals: state.codex_totals,
-       ledger: Ledger.all(),
+       ledger: Ledger.committed_snapshot(),
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
          checking?: state.poll_check_in_progress == true,
