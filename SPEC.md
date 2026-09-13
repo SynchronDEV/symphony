@@ -761,6 +761,13 @@ An issue is dispatch-eligible only if all are true:
     starting a worker or consuming another dispatch attempt. A status change does not resolve a
     dependency. This admission rule does not change termination of already-running workers.
 
+When polling incrementally, refresh unresolved prerequisite observations for retained children
+absent from the delta; a prerequisite's completion need not update its child's timestamp. Deduplicate
+shared prerequisite IDs and use bounded tracker batches. Fresh child records take precedence over
+cached observations. Missing or unknown states remain blocking; a failed prerequisite read skips
+candidate admission without advancing the successful poll cutoff. Full refreshes replace the cache.
+Refreshing observations must not recreate removed candidates or bypass the final dispatch guard.
+
 Sorting order (stable intent):
 
 1. `priority` ascending (1..4 are preferred; null/unknown sorts last)
