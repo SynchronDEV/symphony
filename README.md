@@ -45,6 +45,8 @@ worker and hands validated staging PRs to a human. See
 
 Fresh workers can require a configurable remaining-token reserve. Readiness hook failures block
 before Codex startup, and stopped/retrying execution states persist without resetting issue budgets.
+Unfinished dependencies prevent new dispatches and retries across all active issue states; moving a
+ticket into implementation or review does not bypass its dependency gate.
 
 ## License
 

@@ -226,6 +226,12 @@ Tracker polling, final dispatch refreshes, rate-limit backoff, and workspace cle
 orchestrator mailbox. Reservations count toward capacity while refreshes and worker stops are in
 flight. Results apply only to the operation and worker identity that requested them.
 
+Unfinished or unknown dependencies prevent new workers in every configured active state, including
+review and rework. Initial selection, final asynchronous refresh, and retry admission use the same
+dependency check. Changing an issue from `Todo` to `In Progress` does not satisfy its blockers;
+rejected admission releases the reservation without charging another dispatch attempt or token usage.
+Terminal dependency states are matched without case or surrounding-whitespace sensitivity.
+
 Codex notifications must match the active thread and turn. Failed, interrupted, malformed, or
 unexpected terminal states cannot be treated as successful completion. A timed-out turn must receive
 an interrupt acknowledgement and terminal notification before another turn starts. Retryable Codex
