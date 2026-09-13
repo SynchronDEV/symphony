@@ -232,6 +232,14 @@ dependency check. Changing an issue from `Todo` to `In Progress` does not satisf
 rejected admission releases the reservation without charging another dispatch attempt or token usage.
 Terminal dependency states are matched without case or surrounding-whitespace sensitivity.
 
+With incremental polling, each delta also refreshes the unique unresolved prerequisite IDs of
+retained children that were absent from the delta. This uses the existing batched tracker read,
+so completing a prerequisite can unlock an unchanged child on the next poll. Fresh child records
+take precedence; missing or unknown prerequisite states stay blocked, and failed reads skip
+candidate admission with the usual poll/backoff behavior. Full polls, including the supported
+`POST /api/v1/refresh`, replace the candidate cache without an extra prerequisite read. Final
+worker readiness, reservations, and dispatch/token accounting are unchanged.
+
 Codex notifications must match the active thread and turn. Failed, interrupted, malformed, or
 unexpected terminal states cannot be treated as successful completion. A timed-out turn must receive
 an interrupt acknowledgement and terminal notification before another turn starts. Retryable Codex

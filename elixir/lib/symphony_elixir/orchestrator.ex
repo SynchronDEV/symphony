@@ -164,6 +164,7 @@ defmodule SymphonyElixir.Orchestrator do
       blocked_ids: Map.keys(blocked_refs),
       issue_fetcher: issue_fetcher,
       candidate_fetcher: candidate_fetcher,
+      candidate_cache: state.candidate_cache,
       cutoff: cutoff,
       records: records,
       recipient: recipient,
@@ -434,9 +435,47 @@ defmodule SymphonyElixir.Orchestrator do
       %{
         running: fetch_states(input.running_ids, input.issue_fetcher),
         blocked: fetch_states(input.blocked_ids, input.issue_fetcher),
-        candidates: input.candidate_fetcher.(input.cutoff)
+        candidates: observe_candidates(input)
       }
     end
+  end
+
+  defp observe_candidates(%{cutoff: nil} = input), do: input.candidate_fetcher.(nil)
+
+  defp observe_candidates(input) do
+    with {:ok, issues} <- input.candidate_fetcher.(input.cutoff) do
+      # Linear's child updatedAt does not change when its prerequisite completes.
+      # Fresh delta children already carry current relations; only inspect the retained cache.
+      blocker_ids = unresolved_prerequisite_ids(input.candidate_cache, issues)
+
+      # The existing tracker batches by ID. Missing/unknown states remain blocking;
+      # errors abort candidate admission and retain the existing poll/backoff behavior.
+      with {:ok, blockers} <- fetch_states(blocker_ids, input.issue_fetcher) do
+        {:ok, issues, prerequisite_states(blocker_ids, blockers)}
+      end
+    end
+  end
+
+  defp unresolved_prerequisite_ids(cache, fresh_issues) do
+    terminal_states = terminal_state_set()
+
+    cache
+    |> Map.drop(Enum.map(fresh_issues, & &1.id))
+    |> Map.values()
+    |> Enum.flat_map(& &1.blocked_by)
+    |> Enum.flat_map(fn
+      %{id: id} = blocker when is_binary(id) ->
+        if terminal_issue_state?(Map.get(blocker, :state), terminal_states), do: [], else: [id]
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq()
+  end
+
+  defp prerequisite_states(ids, blockers) do
+    states = Map.new(ids, &{&1, nil})
+    Enum.reduce(blockers, states, fn blocker, acc -> Map.replace(acc, blocker.id, blocker.state) end)
   end
 
   defp async_observation(fun) do
@@ -534,6 +573,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_blocked_observation(state, _poll, _result), do: state
 
+  defp apply_candidate_observation(state, poll, {:ok, issues, blocker_states}) do
+    cache =
+      Map.new(state.candidate_cache, fn {id, issue} ->
+        blockers = Enum.map(issue.blocked_by, &refresh_cached_blocker(&1, blocker_states))
+        {id, %{issue | blocked_by: blockers}}
+      end)
+
+    # Update observations on existing entries only; never resurrect a removed child.
+    # The normal cache update below gives freshly fetched children precedence.
+    apply_candidate_observation(%{state | candidate_cache: cache}, poll, {:ok, issues})
+  end
+
   defp apply_candidate_observation(state, poll, {:ok, issues}) do
     refresh_requested = state.force_full_poll?
 
@@ -552,6 +603,12 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Candidate poll failed: #{inspect(reason)}")
     %{state | force_full_poll?: state.force_full_poll? or poll.force_full?}
   end
+
+  defp refresh_cached_blocker(%{id: id} = blocker, states) when is_map_key(states, id) do
+    Map.put(blocker, :state, Map.fetch!(states, id))
+  end
+
+  defp refresh_cached_blocker(blocker, _states), do: blocker
 
   defp ensure_workspace_mirror do
     case Workspace.ensure_mirror() do
