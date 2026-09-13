@@ -753,8 +753,13 @@ An issue is dispatch-eligible only if all are true:
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
+- Dependency eligibility passes in every configured active state:
+  - Do not dispatch when any blocker is non-terminal or its state is unknown.
+  - Compare blocker states with the configured terminal states after trimming whitespace and
+    normalizing case. No blockers, or only terminal blockers, pass this dependency check.
+  - Apply the same check to the final asynchronous refresh and all retry admission paths before
+    starting a worker or consuming another dispatch attempt. A status change does not resolve a
+    dependency. This admission rule does not change termination of already-running workers.
 
 Sorting order (stable intent):
 
@@ -2106,8 +2111,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
 - Dispatch sort order is priority then oldest creation time
-- `Todo` issue with non-terminal blockers is not eligible
-- `Todo` issue with terminal blockers is eligible
+- Every configured active state rejects non-terminal or unknown blockers
+- Every configured active state accepts no blockers or only normalized terminal blockers
+- A `Todo` to `In Progress` final refresh cannot bypass an unfinished dependency
+- Asynchronous admission and retry reject blocked issues without starting workers or incrementing
+  dispatch/token counters
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace

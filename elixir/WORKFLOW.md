@@ -77,6 +77,8 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
+- New worker admission and retries require every blocker to be terminal in every active state.
+  Moving a ticket from `Todo` into implementation, review, or rework does not resolve its dependencies.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
